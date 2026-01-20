@@ -1,0 +1,14 @@
+yolov11/SKU110K_fixed
+.DS_STORE
+yolov11/models
+yolov11/runs
+dataset_yolo/
+.idea/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+pretrained
+auth
+.venv

@@ -1,0 +1,19 @@
+num_classes: 1
+
+model:
+  # убедитесь, что файл существует и имя точно совпадает
+  weights: models/pretrained/yolo11n.pt
+
+train:
+  data_yaml: configs/data.yaml
+  epochs: 50
+  img_size: 640
+  batch_size: 16
+  lr: 0.001          # будет проброшен как lr0 в train()
+  optimizer: AdamW
+  weight_decay: 0.0005
+  project: runs
+  name: yolov11_sku110
+
+mlflow:
+  experiment_name: yolov11-sku110
