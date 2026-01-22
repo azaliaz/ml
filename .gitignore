@@ -1,8 +1,10 @@
-yolov11/SKU110K_fixed
+SKU110K_fixed
 .DS_STORE
-yolov11/models
+models
 yolov11/runs
-dataset_yolo/
+yolov11/models
+yolov11/mlruns
+yolov11/dataset_yolo
 .idea/
 __pycache__/
 *.py[cod]
@@ -12,3 +14,4 @@ __pycache__/
 pretrained
 auth
 .venv
+yolov11/check_nc.py
