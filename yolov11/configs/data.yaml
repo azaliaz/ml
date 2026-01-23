@@ -1,7 +1,0 @@
-#data.yaml
-path: .
-train: dataset_yolo/train/images
-val: dataset_yolo/val/images
-test: dataset_yolo/test/images
-nc: 1
-names: ['object']
