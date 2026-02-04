@@ -1,14 +1,14 @@
 # src/train.py
 """
-Основной training script:
+Основной training script для YOLOv11:
 - загружает config
-- запускает обучение YOLOv11n
-- считает и логирует метрики
-- сохраняет артефакты в MLflow
+- запускает обучение
+- логирует метрики в MLflow
+- применяет кастомные Albumentations аугментации для обучения
 
 Запуск:
     python src/train.py --config configs/train.yaml
-Опции (переопределяют значения в конфиге):
+Опции:
     --weights, --epochs, --batch, --img_size
 """
 
@@ -23,19 +23,21 @@ import mlflow.pytorch
 import torch
 from typing import Optional, Dict, Any
 import csv
+import os
+
+# -------------------------
+# Новый импорт кастомных аугментаций
+from src import augmentations as augs
+# -------------------------
 
 from src.model import YOLOv11Model
 from src.metrics import extract_metrics_from_ultralytics, log_metrics_mlflow
 
-import os
-
+# MLflow store
 mlflow_store = Path.cwd() / "runs" / "mlflow"
 mlflow_store.mkdir(parents=True, exist_ok=True)
 mlflow.set_tracking_uri(f"file:{mlflow_store}")
-
-
 os.environ["YOLO_DISABLE_MLFLOW"] = "1"
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,24 +46,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+# -------------------------
+# Вспомогательные функции
+# -------------------------
 def load_yaml(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"YAML file not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-
 def resolve_num_classes(cfg: dict, data_yaml_path: Optional[Path]) -> Optional[int]:
-    """
-    Определяет num_classes в порядке приоритета:
-    1) cfg['num_classes'] (train.yaml)
-    2) data_yaml['nc'] (если указан data_yaml)
-    3) None
-    """
     if cfg.get("num_classes") is not None:
         return int(cfg["num_classes"])
-    if data_yaml_path is not None and data_yaml_path.exists():
+    if data_yaml_path and data_yaml_path.exists():
         try:
             dd = load_yaml(data_yaml_path)
             if dd.get("nc") is not None:
@@ -70,39 +67,26 @@ def resolve_num_classes(cfg: dict, data_yaml_path: Optional[Path]) -> Optional[i
             logger.warning("Не удалось прочитать nc из data_yaml: %s", data_yaml_path)
     return None
 
-
 def _sanitize_colname(col: str) -> str:
-    # Преобразовать имя колонки в безопасное для mlflow имя
     name = col.strip()
-    # заменяем слэши и пробелы на подчеркивания, убираем скобки
     for ch in ["/", " ", ":", ","]:
         name = name.replace(ch, "_")
     name = name.replace("(", "").replace(")", "")
-    # убираем подряд идущие _
     while "__" in name:
         name = name.replace("__", "_")
     return name.strip("_")
 
-
 def log_epoch_metrics_from_results_csv(results_csv: Path):
-    """
-    Читает results.csv, ищет колонки precision/recall/map и логирует их в mlflow
-    с шагом = epoch. Также вычисляет f1 если есть precision+recall.
-    """
     if not results_csv.exists():
         logger.info("results.csv не найден: %s — пропускаю логирование по эпохам.", results_csv)
         return
-
     logger.info("Читаю результаты по эпохам из %s", results_csv)
-
-
     metric_tokens = {
         "precision": ["precision"],
         "recall": ["recall"],
         "map50": ["map50", "map@0.5", "mAP50"],
         "map50_95": ["map50_95", "map@0.5:0.95", "mAP", "map"],
     }
-
     with results_csv.open("r", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         headers = reader.fieldnames or []
@@ -114,7 +98,6 @@ def log_epoch_metrics_from_results_csv(results_csv: Path):
                 if any(tok.lower() in hl for tok in tokens):
                     found_cols[metric] = h
                     break
-
 
         epoch_col = None
         for h, hl in zip(headers, headers_l):
@@ -132,9 +115,7 @@ def log_epoch_metrics_from_results_csv(results_csv: Path):
                 except Exception:
                     epoch = None
             if epoch is None:
-
                 epoch = None
-
 
             logged = {}
             for metric, col in found_cols.items():
@@ -160,9 +141,7 @@ def log_epoch_metrics_from_results_csv(results_csv: Path):
                 mlflow.log_metric("f1", float(f1), step=epoch)
 
             for col in headers:
-                if col == epoch_col:
-                    continue
-                if col in found_cols.values():
+                if col == epoch_col or col in found_cols.values():
                     continue
                 raw = row.get(col, "")
                 if raw == "" or raw is None:
@@ -176,15 +155,17 @@ def log_epoch_metrics_from_results_csv(results_csv: Path):
                     name = f"aux_{name}"
                 mlflow.log_metric(name, val, step=epoch)
 
-
+# -------------------------
+# Main
+# -------------------------
 def main(cfg_path: str, override: dict[str, Any] | None = None):
     cfg_path = Path(cfg_path)
     cfg = load_yaml(cfg_path)
     override = override or {}
 
     mlflow_cfg = cfg.get("mlflow", {})
-
     train_cfg = cfg.get("train", {})
+
     if "epochs" in override:
         train_cfg["epochs"] = int(override["epochs"])
     if "batch_size" in override:
@@ -195,7 +176,6 @@ def main(cfg_path: str, override: dict[str, Any] | None = None):
         cfg.setdefault("model", {})["weights"] = str(override["weights"])
 
     data_yaml_path = Path(train_cfg.get("data_yaml", "")) if train_cfg.get("data_yaml") else None
-
     num_classes = resolve_num_classes(cfg, data_yaml_path)
     if num_classes is None:
         logger.warning("num_classes не найден в configs/train.yaml или в data_yaml. Продолжим, но проверьте.")
@@ -207,11 +187,10 @@ def main(cfg_path: str, override: dict[str, Any] | None = None):
     try:
         run = mlflow.start_run(run_name=mlflow_cfg.get("run_name"))
         logger.info("MLflow run started: %s", run.info.run_id)
-
         try:
             mlflow.log_artifact(str(cfg_path), artifact_path="configs")
         except Exception as e:
-            logger.warning("Не удалось залогировать configs/train.yaml в MLflow: %s", e)
+            logger.warning("Не удалось залогировать configs/train.yaml: %s", e)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         mlflow.log_param("device", device)
@@ -220,7 +199,7 @@ def main(cfg_path: str, override: dict[str, Any] | None = None):
         model_cfg = cfg.get("model", {})
         weights_path = model_cfg.get("weights", "yolov11n.pt")
         if not Path(weights_path).exists():
-            logger.info("Weights file '%s' not found locally — ultralytics будет пытаться autoload.", weights_path)
+            logger.info("Weights file '%s' не найден локально — Ultralytics будет пытаться autoload.", weights_path)
             mlflow.log_param("weights_autoload", True)
         else:
             mlflow.log_param("weights_local", str(weights_path))
@@ -230,27 +209,57 @@ def main(cfg_path: str, override: dict[str, Any] | None = None):
             num_classes=num_classes if num_classes is not None else 0,
             device=device,
         )
-        logger.info("Model loaded. num_classes_from_cfg=%s num_classes_from_weights=%s", num_classes, getattr(model, "num_classes", None))
+        logger.info("Model loaded. num_classes_from_cfg=%s num_classes_from_weights=%s",
+                    num_classes, getattr(model, "num_classes", None))
 
-        # Prepare training kwargs
-        train_kwargs = dict(
-            data=train_cfg["data_yaml"],
-            epochs=train_cfg.get("epochs", 50),
-            imgsz=train_cfg.get("img_size", 640),
-            batch=train_cfg.get("batch_size", 16),
-            lr0=train_cfg.get("lr", 1e-3),
-            optimizer=train_cfg.get("optimizer", "AdamW"),
-            weight_decay=train_cfg.get("weight_decay", 5e-4),
-            device=device,
-            project=train_cfg.get("project", "runs"),
-            name=train_cfg.get("name", "exp"),
-            exist_ok=True,
-        )
+        # -------------------------
+        # Подключение кастомных аугментаций
+        # -------------------------
+        img_size = train_cfg.get("img_size", 640)
+        use_custom_augs = not bool(train_cfg.get("disable_custom_augs", False))
+        if use_custom_augs:
+            try:
+                custom_transforms = augs.get_train_augmentations(img_size=img_size)
+                train_kwargs = dict(
+                    data=train_cfg["data_yaml"],
+                    epochs=train_cfg.get("epochs", 50),
+                    imgsz=img_size,
+                    batch=train_cfg.get("batch_size", 16),
+                    lr0=train_cfg.get("lr", 1e-3),
+                    optimizer=train_cfg.get("optimizer", "AdamW"),
+                    weight_decay=train_cfg.get("weight_decay", 5e-4),
+                    device=device,
+                    project=train_cfg.get("project", "runs"),
+                    name=train_cfg.get("name", "exp"),
+                    exist_ok=True,
+                    augmentations=custom_transforms,  # <- здесь передаем кастом
+                )
+                logger.info("Custom Albumentations transforms attached to training.")
+            except Exception as e:
+                logger.warning("Не удалось создать custom augmentations: %s — пропускаю.", e)
+        else:
+            train_kwargs = dict(
+                data=train_cfg["data_yaml"],
+                epochs=train_cfg.get("epochs", 50),
+                imgsz=img_size,
+                batch=train_cfg.get("batch_size", 16),
+                lr0=train_cfg.get("lr", 1e-3),
+                optimizer=train_cfg.get("optimizer", "AdamW"),
+                weight_decay=train_cfg.get("weight_decay", 5e-4),
+                device=device,
+                project=train_cfg.get("project", "runs"),
+                name=train_cfg.get("name", "exp"),
+                exist_ok=True,
+            )
 
+        # Логирование параметров MLflow
         flat_params = {k: v for k, v in train_kwargs.items() if isinstance(v, (int, float, str, bool))}
         mlflow.log_params(flat_params)
         logger.info("Training with params: %s", flat_params)
 
+        # -------------------------
+        # Запуск обучения
+        # -------------------------
         logger.info("Start training...")
         results = model.train(**train_kwargs)
         logger.info("Training finished.")
@@ -300,7 +309,9 @@ def main(cfg_path: str, override: dict[str, Any] | None = None):
         except Exception as e:
             logger.warning("Ошибка при завершении MLflow run: %s", e)
 
-
+# -------------------------
+# CLI
+# -------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to train.yaml")

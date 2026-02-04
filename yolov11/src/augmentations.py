@@ -1,162 +1,135 @@
 # src/augmentations.py
 """
-Аугментации для детекции (albumentations), готовые для использования с YOLO-style
-аннотациями (x_center, y_center, width, height) — все значения нормализованы (0..1).
-
-Экспортируем:
- - get_train_transforms(img_size)
- - get_val_transforms(img_size)
- - get_test_transforms(img_size)
- - parse_yolo_label_file(label_path)
+Наборы аугментаций на основе albumentations для задач детекции.
+Добавлены:
+ - больше видов цветовых/шумовых/геометрических трансформаций
+ - кастомная трансформация "полоски" (stripes) через A.Lambda
+ - аккуратное комбинирование через OneOf, чтобы не применять сразу всё
+BBox format: 'yolo' (x_center, y_center, w, h) — нормализованные 0..1.
 """
-
-from typing import List, Tuple
-from pathlib import Path
-
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+from typing import List, Callable
+import random
 import numpy as np
+import albumentations as A
 
-
-def _make_random_resized_crop(img_size: int, **kwargs):
+# -----------------------
+# Утилита: генерация полосок
+# -----------------------
+def _add_random_stripes(image: np.ndarray, **kwargs) -> np.ndarray:
     """
-    Создаём RandomResizedCrop в робастном режиме — разные версии albumentations
-    принимают либо size=(h,w) либо height=..., width=...
+    Рисует несколько полупрозрачных полос (горизонтальных или вертикальных)
+    поверх изображения. Возвращает изменённый image (uint8 RGB).
+    **kwargs нужен для совместимости с albumentations 1.3+
     """
-    try:
-        # современный API: size=(h,w)
-        return A.RandomResizedCrop(size=(img_size, img_size), **kwargs)
-    except TypeError:
-        # fallback для старых версий
-        return A.RandomResizedCrop(height=img_size, width=img_size, **kwargs)
+    img = image.copy()
+    H, W = img.shape[:2]
+    n_stripes = random.randint(1, 6)
+    orientation = random.choice(["horizontal", "vertical"])
+    color_base = random.choice([(0, 0, 0), (255, 255, 255)]) if random.random() < 0.85 else tuple(np.random.randint(0, 256, 3))
+    alpha = random.uniform(0.2, 0.6)
+
+    for _ in range(n_stripes):
+        if orientation == "horizontal":
+            h = random.randint(max(4, H // 50), max(8, H // 6))
+            y = random.randint(0, H - 1)
+            y1 = max(0, y - h // 2)
+            y2 = min(H, y1 + h)
+            overlay = np.full((y2 - y1, W, 3), color_base, dtype=np.uint8)
+            img[y1:y2, :, :] = (img[y1:y2, :, :].astype(np.float32) * (1 - alpha) +
+                                overlay.astype(np.float32) * alpha).astype(np.uint8)
+        else:
+            w = random.randint(max(4, W // 50), max(8, W // 6))
+            x = random.randint(0, W - 1)
+            x1 = max(0, x - w // 2)
+            x2 = min(W, x1 + w)
+            overlay = np.full((H, x2 - x1, 3), color_base, dtype=np.uint8)
+            img[:, x1:x2, :] = (img[:, x1:x2, :].astype(np.float32) * (1 - alpha) +
+                                overlay.astype(np.float32) * alpha).astype(np.uint8)
+    return img
+
+def Stripes(p: float = 0.3) -> A.Lambda:
+    return A.Lambda(image=_add_random_stripes, p=p)
 
 
-def get_train_transforms(img_size: int = 640):
+
+# -----------------------
+# Основные пайплайны
+# -----------------------
+def get_train_augmentations(img_size: int = 640) -> List[Callable]:
     """
-    Возвращает albumentations.Compose для обучения.
-    Ожидает bboxes в формате 'yolo' (x_center, y_center, w, h) — нормализованные.
+    Возвращает список albumentations трансформов для обучения.
+    Используем комбинацию лёгких эффектов + OneOf для тяжёлых, чтобы
+    одно изображение не получало сразу всё.
     """
-    try:
-        crop = _make_random_resized_crop(img_size, scale=(0.8, 1.0), ratio=(0.75, 1.33), p=0.5)
-    except Exception as e:
-        raise RuntimeError("Не удалось создать RandomResizedCrop — проверьте версию albumentations.") from e
-
-    # Собираем трансформы
-    transforms = [
-        crop,
-        # геометрические (Affine вместо ShiftScaleRotate чтобы убрать предупреждение)
-        A.HorizontalFlip(p=0.5),
-        A.Affine(translate_percent=0.06, scale=(0.88, 1.12), rotate=10, border_mode=0, p=0.5),
-
-        # цветовые / шумы (без специфичных kwargs, чтобы избежать несовместимостей)
+    aug_list = [
+        # легкие размытия/шумы (иногда одно из трёх)
         A.OneOf(
             [
-                A.GaussNoise(p=1.0),  # без var_limit — более совместимо
-                A.ISONoise(p=1.0),
+                A.MotionBlur(blur_limit=7, p=1.0),
+                A.MedianBlur(blur_limit=5, p=1.0),
+                A.GaussianBlur(blur_limit=5, p=1.0),
             ],
-            p=0.2,
+            p=0.25,
         ),
-        A.RandomBrightnessContrast(p=0.5),
-        A.HueSaturationValue(p=0.3),
-        A.OneOf([A.CLAHE(p=1.0), A.Equalize(p=1.0), A.RandomGamma(p=1.0)], p=0.3),
 
-        # мелкое размытие / дефекты
-        A.OneOf([A.MotionBlur(blur_limit=3, p=1.0), A.MedianBlur(blur_limit=3, p=1.0), A.Blur(blur_limit=3, p=1.0)], p=0.1),
+        # дополнительные шумы/ISO-подобные шумы
+        A.GaussNoise(var_limit=(5.0, 50.0), p=0.18),
+        A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=0.12),
 
-        # паддинг до размера
-        A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=0, p=1.0),
+        # цвет и контраст
+        A.CLAHE(clip_limit=2.0, p=0.18),
+        A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=0.6),
+        A.HueSaturationValue(hue_shift_limit=18, sat_shift_limit=30, val_shift_limit=12, p=0.45),
+        A.RandomGamma(gamma_limit=(80, 120), p=0.25),
+        A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.25),
+        A.ChannelShuffle(p=0.08),
 
-        # нормализация и конвертация в тензор
-        # mean/std используются как для ImageNet (совместимо с большинством предобученных бэков)
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ToTensorV2(),
+        # мелкие искажения/перспектива (выбирается одно из сильных искажений)
+        A.OneOf(
+            [
+                A.GridDistortion(num_steps=5, distort_limit=0.3, p=1.0),
+                A.OpticalDistortion(distort_limit=0.08, shift_limit=0.05, p=1.0),
+                A.Perspective(scale=(0.02, 0.07), p=1.0),
+                A.ElasticTransform(alpha=1.0, sigma=50, alpha_affine=20, p=1.0),
+            ],
+            p=0.25,
+        ),
+
+        # геометрические трансформации
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.12),
+        A.RandomRotate90(p=0.15),
+        A.ShiftScaleRotate(shift_limit=0.06, scale_limit=0.12, rotate_limit=18, p=0.5),
+
+        # эффект "царапин/полосок" — кастом
+        Stripes(p=0.25),
+
+        # имитация заслонений/отсечения
+        A.CoarseDropout(max_holes=10, max_height=40, max_width=40, min_holes=1, min_height=8, min_width=8, p=0.2),
+
+        # текстурные/фильтровые эффекты (иногда одно из них)
+        A.OneOf(
+            [
+                A.Sharpen(alpha=(0.1, 0.3), lightness=(0.7, 1.3), p=1.0),
+                A.Emboss(alpha=(0.1, 0.3), strength=(0.1, 0.3), p=1.0),
+                A.RandomFog(fog_coef_lower=0.1, fog_coef_upper=0.3, p=1.0),
+                A.RandomSunFlare(src_radius=100, p=1.0),
+            ],
+            p=0.18,
+        ),
+
+        # финальный ресайз к целевому размеру
+        A.Resize(img_size, img_size, p=1.0),
     ]
-
-    return A.Compose(
-        transforms,
-        bbox_params=A.BboxParams(format="yolo", label_fields=["category_ids"], min_visibility=0.3),
-    )
+    return aug_list
 
 
-def get_val_transforms(img_size: int = 640):
+def get_val_augmentations(img_size: int = 640) -> List[Callable]:
     """
-    Трансформации для валидации: только ресайз/normalize -> tensor.
+    Набор для валидации — минимальный: ресайз.
     """
-    return A.Compose(
-        [
-            A.LongestMaxSize(max_size=img_size),
-            A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=0, p=1.0),
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2(),
-        ],
-        bbox_params=A.BboxParams(format="yolo", label_fields=["category_ids"], min_visibility=0.0),
-    )
+    return [A.Resize(img_size, img_size, p=1.0)]
 
 
-def get_test_transforms(img_size: int = 640):
-    """Те же, что и для валидации."""
-    return get_val_transforms(img_size)
-
-
-
-
-def parse_yolo_label_file(label_path: str) -> Tuple[List[List[float]], List[int]]:
-    """
-    Robust parser for YOLO .txt:
-    - lines: <class_id> <x_center> <y_center> <w> <h>
-    - returns list of [x_c, y_c, w, h] (floats normalized) and list of class ids
-    - if file missing -> returns ([], [])
-    - ensures boxes are clamped so that x1>=0, x2<=1, y1>=0, y2<=1
-    """
-    p = Path(label_path)
-    bboxes = []
-    cls = []
-    if not p.exists():
-        return bboxes, cls
-
-    with p.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split()
-            if len(parts) < 5:
-                continue
-            try:
-                class_id = int(float(parts[0]))
-                x_c = float(parts[1])
-                y_c = float(parts[2])
-                w = float(parts[3])
-                h = float(parts[4])
-            except Exception:
-                continue
-
-            # сначала приведём к числам и защитим от NaN
-            x_c = float(x_c); y_c = float(y_c); w = float(w); h = float(h)
-
-            # вычислим абсолютные нормализованные границы, затем зажмём в [0,1]
-            x1 = max(0.0, x_c - w / 2.0)
-            y1 = max(0.0, y_c - h / 2.0)
-            x2 = min(1.0, x_c + w / 2.0)
-            y2 = min(1.0, y_c + h / 2.0)
-
-            # если после клипирования бокса площадь нулевая — пропускаем
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            # пересчитаем обратно в (x_c, y_c, w, h) гарантируя, что x2<=1 и x1>=0
-            x_c_new = (x1 + x2) / 2.0
-            y_c_new = (y1 + y2) / 2.0
-            w_new = x2 - x1
-            h_new = y2 - y1
-
-            # небольшая дополнительная защита: ещё раз клип
-            x_c_new = float(max(0.0, min(1.0, x_c_new)))
-            y_c_new = float(max(0.0, min(1.0, y_c_new)))
-            w_new = float(max(0.0, min(1.0, w_new)))
-            h_new = float(max(0.0, min(1.0, h_new)))
-
-            bboxes.append([x_c_new, y_c_new, w_new, h_new])
-            cls.append(class_id)
-
-    return bboxes, cls
+def get_test_augmentations(img_size: int = 640) -> List[Callable]:
+    return get_val_augmentations(img_size)
