@@ -36,18 +36,21 @@ task_type = st.sidebar.selectbox(
     }[x]
 )
 
-if task_type != "segmentation":
-    class_name = st.sidebar.text_input("Имя класса (для предразметки / создания меток)", value="object")
-    class_description = st.sidebar.text_area("Описание класса (будет сохранено в метке)", value="", height=120)
-else:
-    class_name = ""
-    class_description = ""
+st.sidebar.markdown("### Классы (по одному на строку)")
+classes_text = st.sidebar.text_area("Введите имена классов (каждый в новой строке)", value="object\nperson", height=140)
+# parse to list
+class_lines = [c.strip() for c in classes_text.splitlines() if c.strip()]
+if not class_lines:
+    class_lines = ["object"]
+
+# optional per-class descriptions (simple: same description for all or left blank)
+class_description_global = st.sidebar.text_area("Описание класса (будет применено ко всем меткам, можно оставить пустым)", value="", height=80)
 
 st.sidebar.markdown("---")
 
 score_threshold = st.sidebar.slider("Порог score (для моделей detection, используется ML-сервисом)", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
 max_boxes = st.sidebar.number_input("Max боксов на изображение (для detection)", min_value=1, max_value=200, value=10)
-
+use_clip = st.sidebar.checkbox("Использовать CLIP для проверки / фильтрации (если доступен)", value=False)
 
 st.sidebar.markdown("---")
 run_preannot = st.sidebar.checkbox("Выполнить предразметку перед импортом в CVAT", value=False)
@@ -72,7 +75,7 @@ uploaded_files = st.file_uploader(
 
 task_name = st.text_input("Название задачи", value="streamlit_task")
 
-def preannotate_stub(local_paths: List[str], class_name: str) -> dict:
+def preannotate_stub(local_paths: List[str], class_names: List[str]) -> dict:
     results = {}
     for p in local_paths:
         try:
@@ -80,11 +83,12 @@ def preannotate_stub(local_paths: List[str], class_name: str) -> dict:
             img = cv2.imread(p)
             h, w = img.shape[:2]
             bbox = [0, 0, w, h]
+            # create a tiny preann JSON listing first class
             ann = {
                 "image": str(p),
                 "predictions": [
                     {
-                        "label": class_name,
+                        "label": class_names[0] if class_names else "object",
                         "bbox": bbox,
                         "score": 1.0,
                         "type": "bbox_stub"
@@ -100,7 +104,7 @@ def preannotate_stub(local_paths: List[str], class_name: str) -> dict:
             results[p] = f"error: {e}"
     return results
 
-def preannotate_via_service(local_paths: List[str], score_thr: float, max_boxes: int, task_type: str, class_name: Optional[str] = None) -> dict:
+def preannotate_via_service(local_paths: List[str], score_thr: float, max_boxes: int, task_type: str, class_names: Optional[List[str]] = None, use_clip_flag: bool = False) -> dict:
     files = []
     opened_files = []
     try:
@@ -115,10 +119,11 @@ def preannotate_via_service(local_paths: List[str], score_thr: float, max_boxes:
             "score_threshold": float(score_thr),
             "max_boxes": int(max_boxes),
             "format": "coco",
-            "task_type": task_type
+            "task_type": task_type,
+            "class_names": class_names or []
         }
-        if task_type != "segmentation" and class_name:
-            payload["class_name"] = class_name
+        if use_clip_flag:
+            payload["use_clip"] = True
 
         resp = requests.post(f"{ML_SERVICE_URL}/preannotate", data={"payload": json.dumps(payload)}, files=files, timeout=600)
         if resp.status_code != 200:
@@ -155,10 +160,15 @@ if st.button("Загрузить в CVAT") and uploaded_files:
     if not local_paths:
         st.error("Нет подходящих изображений для загрузки после фильтрации форматов.")
     else:
-        if task_type == "segmentation":
-            labels_to_create = None
+        # prepare labels for CVAT task creation
+        labels_to_create = []
+        if task_type != "segmentation":
+            for cname in class_lines:
+                labels_to_create.append({"name": cname, "description": class_description_global or ""})
         else:
-            labels_to_create = [{"name": class_name or "object", "description": class_description or ""}]
+            # segmentation: CVAT labels still created (even if SAM masks are not class-distinct)
+            for cname in class_lines:
+                labels_to_create.append({"name": cname, "description": class_description_global or ""})
 
         preann_results = {}
 
@@ -176,8 +186,7 @@ if st.button("Загрузить в CVAT") and uploaded_files:
             if run_preannot:
                 with st.spinner("Выполняю предразметку на ML-сервисе..."):
                     try:
-                        # отправляем task_type; если segmentation — class_name не передаётся в payload внутри функции
-                        preann_results = preannotate_via_service(local_paths, score_threshold, max_boxes, task_type, class_name=(class_name if task_type != "segmentation" else None))
+                        preann_results = preannotate_via_service(local_paths, score_threshold, max_boxes, task_type, class_names=class_lines, use_clip_flag=use_clip)
                     except Exception as e:
                         st.error(f"Ошибка предразметки: {e}")
                         preann_results = {}
