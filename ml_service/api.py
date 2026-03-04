@@ -593,7 +593,7 @@ def health():
     sam_ck_exists = bool(SAM_CHECKPOINT and Path(SAM_CHECKPOINT).exists())
     gnd_ck_exists = bool(GND_DINO_CHECKPOINT and Path(GND_DINO_CHECKPOINT).exists())
 
-    from .models import CLIP_AVAILABLE, CLIP_BACKEND
+    from .models import CLIP_AVAILABLE, CLIP_BACKEND, OWL_AVAILABLE
 
     clip_pkg_installed = bool("CLIP_AVAILABLE" in globals() and CLIP_AVAILABLE)
     clip_model_loaded = MODEL_STORE.get("clip_model") is not None
@@ -636,5 +636,6 @@ def health():
         "clip_model_loaded": clip_model_loaded,
         "clip_preprocess_present": clip_preprocess_present,
         "clip_device": clip_device,
+        "owl_text_detector_available": OWL_AVAILABLE,
     }
 

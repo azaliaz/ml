@@ -4,11 +4,10 @@ __pycache__/
 *$py.class
 *.so
 annotations
+uploads
 images
 .DS_STORE
 .venv
-main_ex.py
 exports
 weights
 GroundingDINO
-uploads
