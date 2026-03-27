@@ -11,3 +11,5 @@ images
 exports
 weights
 GroundingDINO
+cvat
+test_uploader.py

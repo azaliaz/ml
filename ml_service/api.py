@@ -1,7 +1,8 @@
+#api.py
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import io
 import json
 import shutil
@@ -15,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from PIL import Image
 
+from .qwen_llm import qwen_suggest_prompts, ensure_qwen_loaded, QWEN_MODEL_ID
 from .models import (
     MODEL_STORE,
     SAM_CHECKPOINT,
@@ -45,13 +47,26 @@ def create_coco_structure(images_info, annotations, categories):
     return {"images": images_info, "annotations": annotations, "categories": categories}
 
 
-@app.post("/preannotate")
-async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(...)):
-    try:
-        data = json.loads(payload)
-    except Exception as e:
-        return JSONResponse({"error": "Invalid payload JSON", "details": str(e)}, status_code=400)
+def _normalize_list(value: Any, fallback: List[str]) -> List[str]:
+    if isinstance(value, list):
+        out = [str(x).strip() for x in value if str(x).strip()]
+        return out or fallback
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return fallback
+        try:
+            parsed = json.loads(v)
+            if isinstance(parsed, list):
+                out = [str(x).strip() for x in parsed if str(x).strip()]
+                return out or fallback
+        except Exception:
+            pass
+        return [x.strip() for x in v.replace(",", "\n").splitlines() if x.strip()] or fallback
+    return fallback
 
+
+def _parse_class_names(data: Dict[str, Any]) -> List[str]:
     raw_class_names = data.get("class_names", None)
     if raw_class_names is None:
         single = data.get("class_name", None)
@@ -84,7 +99,10 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
 
     if not class_names:
         class_names = ["object"]
+    return class_names
 
+
+def _parse_text_prompts(data: Dict[str, Any], fallback: Optional[List[str]] = None) -> List[str]:
     text_prompts = data.get("text_prompts", None)
     if isinstance(text_prompts, str):
         try:
@@ -94,13 +112,95 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
                 t.strip() for t in text_prompts.replace(",", "\n").splitlines() if t.strip()
             ]
     if text_prompts is None:
-        text_prompts = []
+        text_prompts = fallback or []
+    if not isinstance(text_prompts, list):
+        text_prompts = [str(text_prompts)]
+    text_prompts = [str(x) for x in text_prompts if str(x).strip()]
+    return text_prompts
+
+
+def _apply_qwen_suggestions(
+    *,
+    use_qwen: bool,
+    image_paths: List[str],
+    class_names: List[str],
+    text_prompts: List[str],
+    qwen_instruction: str,
+    task_type: str,
+) -> tuple[List[str], List[str]]:
+    if not use_qwen or not image_paths:
+        return class_names, text_prompts
+
+    try:
+        qwen_result = qwen_suggest_prompts(
+            image_paths[0],
+            qwen_instruction or "Suggest annotation classes and text prompts for this image.",
+            class_names=class_names,
+            task_type=task_type or "auto",
+        )
+        suggested_classes = qwen_result.get("class_names") or class_names
+        suggested_prompts = qwen_result.get("text_prompts") or text_prompts
+
+        class_names = _normalize_list(suggested_classes, class_names)
+        text_prompts = _normalize_list(suggested_prompts, suggested_classes if suggested_classes else class_names)
+
+        logger.info(
+            "Qwen suggestions applied: classes=%s prompts=%s source=%s",
+            class_names,
+            text_prompts,
+            qwen_result.get("source"),
+        )
+    except Exception as e:
+        logger.warning("Qwen suggestion step failed, using original classes/prompts: %s", e)
+
+    return class_names, text_prompts
+
+
+@app.post("/preannotate")
+async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(...)):
+    try:
+        data = json.loads(payload)
+    except Exception as e:
+        return JSONResponse({"error": "Invalid payload JSON", "details": str(e)}, status_code=400)
+
+    class_names = _parse_class_names(data)
+    text_prompts = _parse_text_prompts(data)
 
     score_thr = float(data.get("score_threshold", 0.2))
     max_boxes = int(data.get("max_boxes", 10))
     out_format = data.get("format", "coco")
     use_clip_flag = bool(data.get("use_clip", False))
     task_type = (data.get("task_type") or "").lower().strip()
+
+    use_qwen = bool(data.get("use_qwen", False) or data.get("use_qwen_flag", False))
+    qwen_instruction = str(data.get("qwen_instruction", "") or "").strip()
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="preann_"))
+    images_dir = tmpdir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir = tmpdir / "masks"
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    previews_dir = tmpdir / "previews"
+    previews_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: List[str] = []
+    for file in images:
+        filename = Path(file.filename).name
+        out_path = images_dir / filename
+        with open(out_path, "wb") as fh:
+            content = await file.read()
+            fh.write(content)
+        saved_paths.append(str(out_path))
+
+    # Qwen applies before category creation so categories reflect suggestions.
+    class_names, text_prompts = _apply_qwen_suggestions(
+        use_qwen=use_qwen,
+        image_paths=saved_paths,
+        class_names=class_names,
+        text_prompts=text_prompts,
+        qwen_instruction=qwen_instruction,
+        task_type=task_type or "auto",
+    )
 
     if task_type == "segmentation":
         effective_seg_prompts: List[str] = [str(t) for t in (text_prompts or class_names)]
@@ -139,20 +239,13 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
             strategy = "stub"
 
     logger.info(
-        "Selected preannotation strategy: %s (task_type=%s) classes=%s text_prompts=%s",
+        "Selected preannotation strategy: %s (task_type=%s) classes=%s text_prompts=%s use_qwen=%s",
         strategy,
         task_type or "auto",
         class_names,
         text_prompts,
+        use_qwen,
     )
-
-    tmpdir = Path(tempfile.mkdtemp(prefix="preann_"))
-    images_dir = tmpdir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    masks_dir = tmpdir / "masks"
-    masks_dir.mkdir(parents=True, exist_ok=True)
-    previews_dir = tmpdir / "previews"
-    previews_dir.mkdir(parents=True, exist_ok=True)
 
     annotations: List[Dict[str, Any]] = []
     images_info: List[Dict[str, Any]] = []
@@ -168,15 +261,6 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
 
     ann_id = 1
     img_id = 1
-
-    saved_paths: List[str] = []
-    for file in images:
-        filename = Path(file.filename).name
-        out_path = images_dir / filename
-        with open(out_path, "wb") as fh:
-            content = await file.read()
-            fh.write(content)
-        saved_paths.append(str(out_path))
 
     for p in saved_paths:
         p_path = Path(p)
@@ -451,6 +535,10 @@ async def segment_by_text(payload: str = Form(...), images: List[UploadFile] = F
 
     score_thr = float(data.get("score_threshold", 0.2))
     max_boxes = int(data.get("max_boxes", 10))
+    task_type = (data.get("task_type") or "auto").lower().strip()
+    use_qwen = bool(data.get("use_qwen", False) or data.get("use_qwen_flag", False))
+    qwen_instruction = str(data.get("qwen_instruction", "") or "").strip()
+    class_names = [str(x) for x in text_prompts if str(x).strip()]
 
     tmpdir = Path(tempfile.mkdtemp(prefix="textseg_"))
     images_dir = tmpdir / "images"
@@ -462,11 +550,6 @@ async def segment_by_text(payload: str = Form(...), images: List[UploadFile] = F
 
     annotations: List[Dict[str, Any]] = []
     images_info: List[Dict[str, Any]] = []
-    categories = [{"id": i + 1, "name": name} for i, name in enumerate(text_prompts)]
-    name_to_catid = {c["name"]: c["id"] for c in categories}
-
-    ann_id = 1
-    img_id = 1
 
     saved_paths: List[str] = []
     for file in images:
@@ -477,12 +560,32 @@ async def segment_by_text(payload: str = Form(...), images: List[UploadFile] = F
             fh.write(content)
         saved_paths.append(str(out_path))
 
+    # Qwen can refine text prompts before text-guided segmentation.
+    class_names, text_prompts = _apply_qwen_suggestions(
+        use_qwen=use_qwen,
+        image_paths=saved_paths,
+        class_names=class_names,
+        text_prompts=text_prompts,
+        qwen_instruction=qwen_instruction,
+        task_type=task_type,
+    )
+
+    if not text_prompts:
+        text_prompts = ["object"]
+
+    categories = [{"id": i + 1, "name": name} for i, name in enumerate(text_prompts)]
+    name_to_catid = {c["name"]: c["id"] for c in categories}
+
+    ann_id = 1
+    img_id = 1
+
     for p in saved_paths:
         try:
             img = Image.open(p).convert("RGB")
         except Exception:
             logger.exception("Failed to open image %s", p)
             continue
+
         w, h = img.size
         images_info.append(
             {"id": img_id, "width": w, "height": h, "file_name": Path(p).name}
@@ -593,7 +696,7 @@ def health():
     sam_ck_exists = bool(SAM_CHECKPOINT and Path(SAM_CHECKPOINT).exists())
     gnd_ck_exists = bool(GND_DINO_CHECKPOINT and Path(GND_DINO_CHECKPOINT).exists())
 
-    from .models import CLIP_AVAILABLE, CLIP_BACKEND, OWL_AVAILABLE
+    from .models import CLIP_AVAILABLE, CLIP_BACKEND
 
     clip_pkg_installed = bool("CLIP_AVAILABLE" in globals() and CLIP_AVAILABLE)
     clip_model_loaded = MODEL_STORE.get("clip_model") is not None
@@ -636,6 +739,6 @@ def health():
         "clip_model_loaded": clip_model_loaded,
         "clip_preprocess_present": clip_preprocess_present,
         "clip_device": clip_device,
-        "owl_text_detector_available": OWL_AVAILABLE,
+        "qwen_available": ensure_qwen_loaded(),
+        "qwen_model_id": QWEN_MODEL_ID,
     }
-

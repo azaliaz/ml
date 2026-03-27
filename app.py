@@ -10,7 +10,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 dotenv_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path)
-from cvat_client import create_task_and_upload, export_annotations_by_id, import_annotations_to_task
+from cvat_client import (
+    create_task_and_upload,
+    export_annotations_by_id,
+    import_annotations_to_task,
+    grant_validation_access_for_task,
+)
 
 UPLOAD_DIR = Path("uploads")
 EXPORT_DIR = Path("exports")
@@ -51,7 +56,16 @@ st.sidebar.markdown("---")
 score_threshold = st.sidebar.slider("Порог score (для моделей detection, используется ML-сервисом)", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
 max_boxes = st.sidebar.number_input("Max боксов на изображение (для detection)", min_value=1, max_value=200, value=10)
 use_clip = st.sidebar.checkbox("Использовать CLIP для проверки / фильтрации (если доступен)", value=False)
+use_qwen = st.sidebar.checkbox(
+    "Использовать Qwen для генерации промптов",
+    value=False
+)
 
+qwen_instruction = st.sidebar.text_area(
+    "Инструкция для Qwen",
+    value="Определи, какие объекты нужно разметить на изображениях, и верни JSON с class_names и text_prompts.",
+    height=120,
+)
 st.sidebar.markdown("---")
 run_preannot = st.sidebar.checkbox("Выполнить предразметку перед импортом в CVAT", value=False)
 
@@ -104,7 +118,16 @@ def preannotate_stub(local_paths: List[str], class_names: List[str]) -> dict:
             results[p] = f"error: {e}"
     return results
 
-def preannotate_via_service(local_paths: List[str], score_thr: float, max_boxes: int, task_type: str, class_names: Optional[List[str]] = None, use_clip_flag: bool = False) -> dict:
+def preannotate_via_service(
+    local_paths: List[str],
+    score_thr: float,
+    max_boxes: int,
+    task_type: str,
+    class_names: Optional[List[str]] = None,
+    use_clip_flag: bool = False,
+    use_qwen: bool = False,
+    qwen_instruction: str = "",
+) -> dict:
     files = []
     opened_files = []
     try:
@@ -120,12 +143,14 @@ def preannotate_via_service(local_paths: List[str], score_thr: float, max_boxes:
             "max_boxes": int(max_boxes),
             "format": "coco",
             "task_type": task_type,
-            "class_names": class_names or []
+            "class_names": class_names or [],
+            "use_qwen": bool(use_qwen),
+            "qwen_instruction": qwen_instruction or "",
         }
         if use_clip_flag:
             payload["use_clip"] = True
 
-        resp = requests.post(f"{ML_SERVICE_URL}/preannotate", data={"payload": json.dumps(payload)}, files=files, timeout=600)
+        resp = requests.post(f"{ML_SERVICE_URL}/preannotate", data={"payload": json.dumps(payload)}, files=files, timeout=18000)
         if resp.status_code != 200:
             raise RuntimeError(f"ML service returned status {resp.status_code}: {resp.text}")
 
@@ -144,6 +169,7 @@ def preannotate_via_service(local_paths: List[str], score_thr: float, max_boxes:
             except Exception:
                 pass
 
+# --- основной блок загрузки в CVAT (без изменений) ---
 if st.button("Загрузить в CVAT") and uploaded_files:
     allowed_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
     local_paths = []
@@ -184,9 +210,38 @@ if st.button("Загрузить в CVAT") and uploaded_files:
             st.session_state["uploaded_files"] = local_paths
 
             if run_preannot:
-                with st.spinner("Выполняю предразметку на ML-сервисе..."):
+                task_type_label = {
+                    "detection": "Детекция",
+                    "segmentation": "Сегментация",
+                    "classification": "Классификация",
+                    "other": "Другое",
+                }.get(task_type, task_type)
+                classes_str = ", ".join(class_lines) if class_lines else "-"
+                desc_str = class_description_global.strip()
+                extra_parts = []
+                if desc_str:
+                    extra_parts.append(f"описание: {desc_str}")
+                extra_parts.append(f"score ≥ {score_threshold}")
+                extra_parts.append(f"max_boxes = {int(max_boxes)}")
+                if use_clip:
+                    extra_parts.append("CLIP: да")
+                info_line = f"{task_type_label} · классы: {classes_str} · " + " · ".join(extra_parts)
+
+                st.markdown("**Предразметка**")
+                st.caption(info_line)
+
+                with st.spinner(f"Выполняю предразметку: {info_line}"):
                     try:
-                        preann_results = preannotate_via_service(local_paths, score_threshold, max_boxes, task_type, class_names=class_lines, use_clip_flag=use_clip)
+                        preann_results = preannotate_via_service(
+                            local_paths,
+                            score_threshold,
+                            max_boxes,
+                            task_type,
+                            class_names=class_lines,
+                            use_clip_flag=use_clip,
+                            use_qwen=use_qwen,
+                            qwen_instruction=qwen_instruction,
+                        )
                     except Exception as e:
                         st.error(f"Ошибка предразметки: {e}")
                         preann_results = {}
@@ -227,18 +282,6 @@ if st.button("Загрузить в CVAT") and uploaded_files:
                         except Exception:
                             st.info("Не удалось открыть архив превью или показать превью.")
 
-                        # Показываем превью из session_state
-                        previews = st.session_state.get("previews_data", {})
-                        if previews:
-                            st.markdown("**Превью предразметки**")
-                            num_cols = min(4, len(previews))  # максимум 4 колонки
-                            cols = st.columns(num_cols)
-                            for i, (pn, data) in enumerate(previews.items()):
-                                try:
-                                    col = cols[i % num_cols]
-                                    col.image(data, width=300, caption=Path(pn).name)
-                                except Exception:
-                                    continue
                         with st.spinner("Импорт аннотаций в CVAT..."):
                             try:
                                 rq = import_annotations_to_task(int(task_id), archive, format_name="COCO 1.0",
@@ -292,3 +335,65 @@ if "task_id" in st.session_state:
 
 else:
     st.warning("Сначала загрузите файлы в CVAT!")
+
+# --- Постоянный блок превью предразметки (не пропадает при других действиях) ---
+previews_persist = st.session_state.get("previews_data", {})
+if previews_persist:
+    st.write("---")
+    st.markdown("**Превью предразметки**")
+    # Показываем только одно (первое) превью
+    first_name, first_data = sorted(previews_persist.items())[0]
+    st.image(first_data, width=300, caption=Path(first_name).name)
+
+st.write("---")
+st.header("Выдать доступ на валидацию (review) в CVAT")
+
+current_task_id = st.session_state.get("task_id")
+if current_task_id is None:
+    st.info("Сначала создайте задачу (чтобы появился `task_id`).")
+else:
+    st.markdown(f"**task_id:** `{current_task_id}`")
+
+    # Показываем результат в одном месте (без “шумных” блоков)
+    result_box = st.empty()
+
+    # Form prevents reruns on each keystroke, so previews won't flicker/disappear
+    with st.form("assign_validator_form", clear_on_submit=False):
+        reviewer_user = st.text_input("Валидатор (username / email / user id)", value="")
+        submitted = st.form_submit_button("Назначить")
+
+    if submitted:
+        if not reviewer_user.strip():
+            result_box.error("Введите username/email или user id.")
+        else:
+            with st.spinner("Назначаю валидатора..."):
+                try:
+                    res = grant_validation_access_for_task(
+                        int(current_task_id), reviewer_user.strip(), timeout=120
+                    )
+                except Exception as e:
+                    result_box.error(f"Не удалось назначить: {e}")
+                else:
+                    failed = res.get("jobs_failed") or []
+                    patched = res.get("jobs_patched") or []
+                    reviewer_id = res.get("reviewer_id")
+
+                    if failed or not patched:
+                        status_codes = []
+                        for f in failed:
+                            lr = f.get("last_response") or {}
+                            sc = lr.get("status_code")
+                            if isinstance(sc, int):
+                                status_codes.append(sc)
+                        if 403 in status_codes:
+                            result_box.error("403: нет прав назначать пользователей на job. Используйте admin/owner токен.")
+                        else:
+                            result_box.error("Не удалось назначить валидатора.")
+                        with st.expander("Детали"):
+                            st.json(res)
+                    else:
+                        # Минимальный успех: имя/ввод + (id если введён числом)
+                        name = reviewer_user.strip()
+                        if name.isdigit() and reviewer_id is not None:
+                            name = f"id={reviewer_id}"
+                        result_box.success(f"Валидатор назначен: {name}")

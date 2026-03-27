@@ -115,94 +115,6 @@ def run_inference_grounding_dino(
         return run_inference_grounding_dino_stub(image_path, text_prompt, score_threshold, max_boxes)
 
 
-def run_inference_owlvit(
-    image_path: str,
-    text_prompt: str,
-    score_threshold: float = 0.3,
-    max_boxes: int = 10,
-) -> List[Dict[str, Any]]:
-    """
-    Optional extra text-guided detector based on OWL-ViT / Owlv2.
-    Returns list of dicts with same 'bbox' / 'score' / 'label' keys as GroundingDINO.
-    """
-    owl_model = MODEL_STORE.get("owl_model")
-    owl_processor = MODEL_STORE.get("owl_processor")
-    device = MODEL_STORE.get("owl_device")
-    if owl_model is None or owl_processor is None or device is None:
-        logger.debug("OWL-ViT not available in MODEL_STORE.")
-        return []
-
-    try:
-        import torch
-    except Exception:
-        return []
-
-    try:
-        image = Image.open(image_path).convert("RGB")
-    except Exception as e:
-        logger.exception("OWL-ViT: failed to open image %s: %s", image_path, e)
-        return []
-
-    try:
-        # text format: batch of lists of phrases
-        inputs = owl_processor(
-            text=[[text_prompt]],
-            images=[image],
-            return_tensors="pt",
-        )
-        # move tensors to device
-        inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = owl_model(**inputs)
-
-        target_sizes = [image.size[::-1]]  # (height, width)
-        postprocess = getattr(
-            owl_processor,
-            "post_process_object_detection",
-            getattr(owl_processor, "post_process", None),
-        )
-        if postprocess is None:
-            logger.warning("OWL-ViT processor has no post_process_object_detection")
-            return []
-
-        results = postprocess(
-            outputs=outputs,
-            target_sizes=target_sizes,
-        )[0]
-
-        boxes = results.get("boxes", None)
-        scores = results.get("scores", None)
-        if boxes is None or len(boxes) == 0:
-            logger.info("OWL-ViT returned 0 boxes for prompt '%s'.", text_prompt)
-            return []
-
-        boxes = boxes.detach().cpu().numpy()
-        scores = scores.detach().cpu().numpy() if scores is not None else np.zeros((len(boxes),))
-        # results["labels"] indexes into provided text queries; we have only one
-
-        out: List[Dict[str, Any]] = []
-        for box, score in zip(boxes, scores):
-            score_f = float(score)
-            if score_f < score_threshold:
-                continue
-            x0, y0, x1, y1 = [int(v) for v in box.tolist()]
-            out.append(
-                {
-                    "bbox": [x0, y0, x1, y1],
-                    "score": score_f,
-                    "label": text_prompt,
-                    "source": "owlvit",
-                }
-            )
-        out = sorted(out, key=lambda x: -x["score"])[:max_boxes]
-        logger.info("OWL-ViT detected %d boxes for prompt '%s'.", len(out), text_prompt)
-        logger.debug("OWL-ViT boxes: %s", [o["bbox"] for o in out])
-        return out
-    except Exception as e:
-        logger.exception("OWL-ViT inference crashed: %s", e)
-        return []
-
-
 def run_inference_clip_classify(image_path: str, labels: List[str]) -> List[Dict[str, Any]]:
     if MODEL_STORE.get("clip_model") is None or MODEL_STORE.get("clip_preprocess") is None:
         logger.debug("CLIP model or preprocess missing, returning zero scores.")
@@ -485,15 +397,7 @@ def run_text_guided_segmentation(
     max_boxes_per_prompt: int = 10,
     sam_multimask_k: int = 3,
 ) -> List[Dict[str, Any]]:
-    """
-    For each text prompt:
-      - run GroundingDINO to get boxes
-      - for each box run SAM (multimask)
-      - optionally run edge-based thin extraction
-      - score masks by weighted sum (SAM_score, CLIP_score, edge_score)
-      - choose best mask(s), post-process, return list of annotations with mask paths temporarily omitted
-    Returns list of dicts: {"prompt":..., "bbox":[x0,y0,x1,y1], "score":..., "mask": np.ndarray, "label": chosen_label}
-    """
+
     results: List[Dict[str, Any]] = []
 
     has_clip = MODEL_STORE.get("clip_model") is not None and MODEL_STORE.get("clip_preprocess") is not None
@@ -508,28 +412,6 @@ def run_text_guided_segmentation(
         except Exception as e:
             logger.exception("Grounding for prompt '%s' failed: %s", prompt, e)
             boxes = []
-
-        try:
-            owl_boxes = run_inference_owlvit(
-                image_path, prompt, score_threshold, max_boxes_per_prompt
-            )
-        except Exception as e:
-            logger.exception("OWL-ViT for prompt '%s' failed: %s", prompt, e)
-            owl_boxes = []
-
-        # Log counts right away
-        logger.info("Prompt '%s': groundingdino returned %d boxes, owl returned %d boxes", prompt, len(boxes), len(owl_boxes))
-
-        if boxes and owl_boxes:
-            # объединяем и немного ограничиваем общее кол-во
-            combined_boxes = boxes + owl_boxes
-            combined_boxes = sorted(
-                combined_boxes, key=lambda x: -float(x.get("score", 0.0))
-            )[: max_boxes_per_prompt * 2]
-            boxes = combined_boxes
-            logger.debug("Combined boxes count after merging GND+OWL: %d", len(boxes))
-        elif not boxes and owl_boxes:
-            boxes = owl_boxes
 
         if not boxes:
             if MODEL_STORE.get("sam_automatic_generator") is not None:

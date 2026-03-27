@@ -23,8 +23,6 @@ GND_DINO_AVAILABLE = False
 CLIP_AVAILABLE = False
 CLIP_BACKEND: str | None = None
 
-OWL_AVAILABLE = False
-
 SAM_CHECKPOINT = os.environ.get("SAM_CHECKPOINT", "").strip()
 GND_DINO_CHECKPOINT = os.environ.get("GND_DINO_CHECKPOINT", "").strip()
 GND_DINO_CONFIG = os.environ.get("GND_DINO_CONFIG", "").strip()
@@ -40,9 +38,6 @@ MODEL_STORE: Dict[str, Any] = {
     "clip_model": None,
     "clip_preprocess": None,
     "clip_device": None,
-    "owl_model": None,
-    "owl_processor": None,
-    "owl_device": None,
 }
 
 
@@ -326,63 +321,6 @@ def load_clip_if_available(model_name: str = "ViT-B-32", pretrained: str = "open
         MODEL_STORE["clip_device"] = None
 
 
-def load_owlvit_if_available() -> None:
-    """
-    Optional loader for a text-guided detector (OWL-ViT or Owlv2).
-    Used as дополнительный источник боксов для run_text_guided_segmentation.
-    """
-    global OWL_AVAILABLE
-
-    try:
-        # Prefer newer Owlv2, fall back to OwlViT if not available
-        try:
-            from transformers import Owlv2Processor, Owlv2ForObjectDetection  # type: ignore
-
-            model_cls = Owlv2ForObjectDetection
-            processor_cls = Owlv2Processor
-            checkpoint = os.environ.get("OWL_CHECKPOINT", "google/owlv2-base-patch16")
-            model_type = "owlv2"
-        except Exception:
-            from transformers import OwlViTProcessor, OwlViTForObjectDetection  # type: ignore
-
-            model_cls = OwlViTForObjectDetection
-            processor_cls = OwlViTProcessor
-            checkpoint = os.environ.get("OWL_CHECKPOINT", "google/owlvit-base-patch32")
-            model_type = "owlvit"
-    except Exception as e:
-        logger.info("transformers / OWL-ViT not available: %s", e)
-        OWL_AVAILABLE = False
-        return
-
-    try:
-        import torch
-    except Exception:
-        torch = None  # type: ignore[assignment]
-
-    if torch is not None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device = "cpu"
-
-    try:
-        logger.info("Attempting to load %s from checkpoint %s on %s", model_type, checkpoint, device)
-        processor = processor_cls.from_pretrained(checkpoint)
-        model = model_cls.from_pretrained(checkpoint)
-        model.to(device)
-        model.eval()
-        MODEL_STORE["owl_model"] = model
-        MODEL_STORE["owl_processor"] = processor
-        MODEL_STORE["owl_device"] = device
-        OWL_AVAILABLE = True
-        logger.info("Loaded %s text detector from %s (device=%s).", model_type, checkpoint, device)
-    except Exception as e:
-        logger.exception("Failed to load OWL text detector: %s", e)
-        MODEL_STORE["owl_model"] = None
-        MODEL_STORE["owl_processor"] = None
-        MODEL_STORE["owl_device"] = None
-        OWL_AVAILABLE = False
-
 load_sam_model_if_available()
 load_groundingdino_if_available()
 load_clip_if_available()
-load_owlvit_if_available()

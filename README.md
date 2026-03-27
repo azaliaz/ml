@@ -15,12 +15,13 @@ pip install -r requirements.txt
 
 3. Экспортируйте переменные окружения
 ```
-export CVAT_TOKEN="4c2qs4PC.KeFbJBXxSBTkqYjaMobY7vnlOCZ2DwIX"
 export CVAT_URL="https://app.cvat.ai" 
 export SAM_CHECKPOINT="weights/sam_vit_b_01ec64.pth"
 export GND_DINO_CHECKPOINT="weights/groundingdino_swint_ogc.pth"
 export GND_DINO_CONFIG="GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 export ML_SERVICE_URL="http://localhost:8000"
+export QWEN_MODEL_ID="Qwen/Qwen2.5-VL-7B-Instruct"
+export QWEN_MAX_NEW_TOKENS=256
 ```
 
  export GND_DINO_CONFIG=groundingdino/groundingdino/config/GroundingDINO_SwinT_OGC.py
