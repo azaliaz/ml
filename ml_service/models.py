@@ -9,12 +9,24 @@ import sys
 
 logger = logging.getLogger("preann_service")
 
-# Configure basic logging only if no handlers attached (keeps behavior stable on re-import)
+# Ensure preann_service logs are visible under any server (uvicorn/fastapi-cli/etc).
+# Some runtimes install their own logging config and may not show non-uvicorn loggers
+# unless they have an explicit handler.
 if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
+    _h = logging.StreamHandler(stream=sys.stdout)
+    _h.setLevel(logging.INFO)
+    _h.setFormatter(logging.Formatter("%(levelname)s: %(name)s:%(message)s"))
+    logger.addHandler(_h)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 # Allow enabling DEBUG via env var PREANN_DEBUG=1
 if os.environ.get("PREANN_DEBUG", "") in ("1", "true", "True"):
     logger.setLevel(logging.DEBUG)
+    for _hh in list(logger.handlers):
+        try:
+            _hh.setLevel(logging.DEBUG)
+        except Exception:
+            pass
 
 # Global feature flags
 SAM_AVAILABLE = False

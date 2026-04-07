@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +15,7 @@ logger = logging.getLogger("preann_service")
 
 QWEN_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
 QWEN_MAX_NEW_TOKENS = int(os.environ.get("QWEN_MAX_NEW_TOKENS", "256"))
+QWEN_MAX_TIME_S = float(os.environ.get("QWEN_MAX_TIME_S", "25"))
 
 _QWEN_MODEL = None
 _QWEN_PROCESSOR = None
@@ -116,10 +118,12 @@ def qwen_suggest_prompts(
             "source": "qwen" | "fallback"
         }
     """
+    t0 = time.time()
     fallback_classes = class_names or ["object"]
     fallback_prompts = fallback_classes
 
     if not ensure_qwen_loaded():
+        logger.info("Qwen suggest fallback (not loaded) in %.2fs", time.time() - t0)
         return {
             "class_names": fallback_classes,
             "text_prompts": fallback_prompts,
@@ -131,6 +135,7 @@ def qwen_suggest_prompts(
         import torch
     except Exception as e:
         logger.warning("Torch unavailable for Qwen inference: %s", e)
+        logger.info("Qwen suggest fallback (no torch) in %.2fs", time.time() - t0)
         return {
             "class_names": fallback_classes,
             "text_prompts": fallback_prompts,
@@ -141,6 +146,12 @@ def qwen_suggest_prompts(
     assert _QWEN_MODEL is not None
     assert _QWEN_PROCESSOR is not None
 
+    logger.info(
+        "Qwen suggest start: image=%s task_type=%s max_new_tokens=%s",
+        Path(image_path).name,
+        task_type,
+        QWEN_MAX_NEW_TOKENS,
+    )
     image = Image.open(image_path).convert("RGB")
     instruction = (user_instruction or "").strip()
     if not instruction:
@@ -186,11 +197,14 @@ def qwen_suggest_prompts(
         ).to(_QWEN_MODEL.device)
 
         with torch.no_grad():
+            logger.info("Qwen generate start (max_time=%.1fs)", QWEN_MAX_TIME_S)
             generated_ids = _QWEN_MODEL.generate(
                 **inputs,
                 max_new_tokens=QWEN_MAX_NEW_TOKENS,
                 do_sample=False,
+                max_time=QWEN_MAX_TIME_S,
             )
+            logger.info("Qwen generate done in %.2fs", time.time() - t0)
 
         trimmed = [
             out_ids[len(in_ids) :]
@@ -206,6 +220,12 @@ def qwen_suggest_prompts(
         suggested_classes = _normalize_list(parsed.get("class_names"), fallback_classes)
         suggested_prompts = _normalize_list(parsed.get("text_prompts"), suggested_classes)
 
+        logger.info(
+            "Qwen suggest done in %.2fs (classes=%d prompts=%d)",
+            time.time() - t0,
+            len(suggested_classes),
+            len(suggested_prompts),
+        )
         return {
             "class_names": suggested_classes,
             "text_prompts": suggested_prompts,
@@ -215,6 +235,7 @@ def qwen_suggest_prompts(
 
     except Exception as e:
         logger.exception("Qwen prompt suggestion failed: %s", e)
+        logger.info("Qwen suggest fallback (exception) in %.2fs", time.time() - t0)
         return {
             "class_names": fallback_classes,
             "text_prompts": fallback_prompts,

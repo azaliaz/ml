@@ -13,3 +13,6 @@ weights
 GroundingDINO
 cvat
 test_uploader.py
+frontend/node_modules/
+frontend/.npm-cache/
+frontend/dist/

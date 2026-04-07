@@ -16,6 +16,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from PIL import Image
 
+try:
+    from pycocotools import mask as mask_utils  # type: ignore
+except Exception:
+    mask_utils = None  # type: ignore[assignment]
+
 from .qwen_llm import qwen_suggest_prompts, ensure_qwen_loaded, QWEN_MODEL_ID
 from .models import (
     MODEL_STORE,
@@ -45,6 +50,24 @@ app.add_middleware(
 
 def create_coco_structure(images_info, annotations, categories):
     return {"images": images_info, "annotations": annotations, "categories": categories}
+
+def _mask_to_coco_segmentation(mask: np.ndarray) -> tuple[dict[str, Any] | list, int]:
+    """
+    Convert binary mask (0/1) to COCO RLE segmentation dict + area.
+    CVAT COCO importer expects valid `segmentation` (RLE or polygons) for masks.
+    """
+    m = (mask > 0).astype(np.uint8)
+    area = int(m.sum())
+    if area <= 0:
+        return [], 0
+    if mask_utils is None:
+        # Fallback: cannot encode RLE -> no segmentation (will be treated as bbox-only)
+        return [], area
+    rle = mask_utils.encode(np.asfortranarray(m))
+    # pycocotools uses bytes for counts -> make JSON-serializable
+    if isinstance(rle, dict) and isinstance(rle.get("counts"), (bytes, bytearray)):
+        rle["counts"] = rle["counts"].decode("ascii")
+    return rle, area
 
 
 def _normalize_list(value: Any, fallback: List[str]) -> List[str]:
@@ -314,14 +337,16 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
                 cat_id = name_to_catid.get(
                     label, name_to_catid.get(fallback_label, 1)
                 )
+                segmentation, area = _mask_to_coco_segmentation(mask)
                 ann = {
                     "id": ann_id,
                     "image_id": img_id,
                     "category_id": cat_id,
                     "bbox": [x0, y0, x1 - x0, y1 - y0],
                     "score": score,
-                    "segmentation": [],
+                    "segmentation": segmentation,
                     "iscrowd": 0,
+                    "area": area,
                     "mask_path": f"masks/{mask_fname}",
                 }
                 annotations.append(ann)
@@ -421,14 +446,16 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
                     mask_path = masks_dir / mask_fname
                     Image.fromarray((mask * 255).astype(np.uint8)).save(mask_path)
                     x0, y0, x1, y1 = bbox
+                    segmentation, area = _mask_to_coco_segmentation(mask)
                     ann = {
                         "id": ann_id,
                         "image_id": img_id,
                         "category_id": name_to_catid.get(class_names[0], 1),
                         "bbox": [x0, y0, x1 - x0, y1 - y0],
                         "score": score,
-                        "segmentation": [],
+                        "segmentation": segmentation,
                         "iscrowd": 0,
+                        "area": area,
                         "mask_path": f"masks/{mask_fname}",
                     }
                     annotations.append(ann)
@@ -441,6 +468,7 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
                 Image.fromarray((mask * 255).astype(np.uint8)).save(
                     masks_dir / mask_fname
                 )
+                segmentation, area = _mask_to_coco_segmentation(mask)
                 annotations.append(
                     {
                         "id": ann_id,
@@ -448,8 +476,9 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
                         "category_id": name_to_catid.get(class_names[0], 1),
                         "bbox": [0, 0, w, h],
                         "score": 1.0,
-                        "segmentation": [],
+                        "segmentation": segmentation,
                         "iscrowd": 0,
+                        "area": area,
                         "mask_path": f"masks/{mask_fname}",
                     }
                 )
@@ -613,14 +642,16 @@ async def segment_by_text(payload: str = Form(...), images: List[UploadFile] = F
                 )
             x0, y0, x1, y1 = bbox
             cat_id = name_to_catid.get(label, 1)
+            segmentation, area = _mask_to_coco_segmentation(mask)
             ann = {
                 "id": ann_id,
                 "image_id": img_id,
                 "category_id": cat_id,
                 "bbox": [x0, y0, x1 - x0, y1 - y0],
                 "score": score,
-                "segmentation": [],
+                "segmentation": segmentation,
                 "iscrowd": 0,
+                "area": area,
                 "mask_path": f"masks/{mask_fname}",
             }
             annotations.append(ann)
