@@ -15,10 +15,118 @@ try:
 except Exception:
     cv2 = None  # type: ignore[assignment]
 
-from .models import MODEL_STORE, MAX_MASKS_PER_IMAGE, logger
+from .models import (
+    MODEL_STORE,
+    MAX_MASKS_PER_IMAGE,
+    logger,
+)
 
 # Ensure logger configured (user can set PREANN_DEBUG=1 to enable DEBUG)
 logger = logging.getLogger("preann_service")
+
+
+def _is_sam3_backend() -> bool:
+    return str(os.environ.get("SAM_BACKEND", "sam")).strip().lower() in {
+        "sam3",
+        "sam3_hf",
+        "sam3_native",
+        "sam3-official",
+        "native",
+        "hf",
+        "huggingface",
+    }
+
+
+def _is_sam3_native_backend() -> bool:
+    if MODEL_STORE.get("sam_backend_mode") == "native":
+        return True
+    return str(os.environ.get("SAM_BACKEND", "sam")).strip().lower() in {
+        "sam3_native",
+        "sam3-official",
+        "native",
+    }
+
+
+def _clip_bbox_to_shape(box: List[int], h: int, w: int) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = [int(v) for v in box]
+    x0 = max(0, min(w - 1, x0))
+    y0 = max(0, min(h - 1, y0))
+    x1 = max(0, min(w, x1))
+    y1 = max(0, min(h, y1))
+    return x0, y0, x1, y1
+
+
+def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    aa = (a > 0)
+    bb = (b > 0)
+    inter = float(np.logical_and(aa, bb).sum())
+    union = float(np.logical_or(aa, bb).sum())
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
+def _postprocess_mask(mask: np.ndarray, bbox: List[int], *, is_rope_like: bool) -> np.ndarray:
+    m = (np.array(mask) > 0).astype(np.uint8)
+    if m.ndim != 2 or m.size == 0:
+        return np.zeros_like(np.array(mask), dtype=np.uint8)
+    h, w = m.shape
+    x0, y0, x1, y1 = _clip_bbox_to_shape(bbox, h, w)
+    if x1 <= x0 or y1 <= y0:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    box_area = max(1, (x1 - x0) * (y1 - y0))
+    constrained = np.zeros_like(m, dtype=np.uint8)
+    constrained[y0:y1, x0:x1] = m[y0:y1, x0:x1]
+
+    if cv2 is None:
+        return constrained.astype(np.uint8)
+
+    mask_u8 = constrained * 255
+    if is_rope_like:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 1))
+    else:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
+    if not is_rope_like:
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    nb_components, output, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    final_mask = np.zeros_like(mask_u8)
+    min_component_px = max(6, min(48, int(box_area * 0.002)))
+    for i in range(1, nb_components):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area >= min_component_px:
+            final_mask[output == i] = 255
+
+    if not is_rope_like and int(final_mask.sum()) > 0:
+        # Fill tiny holes to get cleaner closed boundaries on compact objects.
+        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    return (final_mask > 0).astype(np.uint8)
+
+
+def _dedupe_overlapping_masks(
+    masks: List[Dict[str, Any]],
+    *,
+    iou_thr: float = 0.85,
+) -> List[Dict[str, Any]]:
+    if not masks:
+        return []
+    ordered = sorted(masks, key=lambda x: -float(x.get("score", 0.0)))
+    kept: List[Dict[str, Any]] = []
+    for cand in ordered:
+        cm = cand.get("mask")
+        if cm is None:
+            continue
+        drop = False
+        for k in kept:
+            if _mask_iou(cm, k["mask"]) >= iou_thr:
+                drop = True
+                break
+        if not drop:
+            kept.append(cand)
+    return kept
 
 def run_inference_grounding_dino_stub(
     image_path: str,
@@ -45,6 +153,15 @@ def run_inference_grounding_dino_real(
     if gnd_model is None or gnd_inference is None:
         logger.warning("GroundingDINO not loaded -> stub fallback")
         return run_inference_grounding_dino_stub(image_path, text_prompt, score_threshold, max_boxes)
+
+    from .models import GND_DINO_CUDA_OPS
+
+    if not GND_DINO_CUDA_OPS:
+        logger.warning(
+            "GroundingDINO CUDA ops missing (_C) — skip inference for '%s'.",
+            text_prompt,
+        )
+        return []
 
     try:
         import torch
@@ -213,7 +330,11 @@ def run_inference_sam_predictor(
         return mask, 0.0
 
 
-def run_inference_sam_auto(image_path: str, max_masks: int = 30) -> List[Dict[str, Any]]:
+def run_inference_sam_auto(
+    image_path: str,
+    max_masks: int = 30,
+    text_prompt: str | None = None,
+) -> List[Dict[str, Any]]:
     mag = MODEL_STORE.get("sam_automatic_generator")
     if mag is None:
         img = Image.open(image_path).convert("RGB")
@@ -230,7 +351,14 @@ def run_inference_sam_auto(image_path: str, max_masks: int = 30) -> List[Dict[st
         return []
 
     try:
-        results_raw = mag.generate(image_np)
+        # HF SAM3 adapter supports text_prompt; classic SAM generator ignores prompt.
+        if text_prompt:
+            try:
+                results_raw = mag.generate(image_np, text_prompt=text_prompt)
+            except TypeError:
+                results_raw = mag.generate(image_np)
+        else:
+            results_raw = mag.generate(image_np)
         proposals: List[Dict[str, Any]] = []
         for r in results_raw[:max_masks]:
             mask_arr = r.get("segmentation", None)
@@ -272,25 +400,112 @@ def run_inference_sam_multimask(
         return [{"mask": mask, "score": score}]
     try:
         image_np = np.array(Image.open(image_path).convert("RGB"))
-        predictor.set_image(image_np)
         x0, y0, x1, y1 = [int(v) for v in box]
+        h, w = image_np.shape[:2]
+        x0 = max(0, min(w - 1, x0))
+        x1 = max(0, min(w, x1))
+        y0 = max(0, min(h - 1, y0))
+        y1 = max(0, min(h, y1))
+        if x1 <= x0 or y1 <= y0:
+            logger.debug("SAM multimask: invalid box after clipping %s", box)
+            return []
+
+        # For HF SAM3 backend, box prompting via generic pipeline may be unstable.
+        # Use crop-local auto generation as primary path and remap to full image coords.
+        if _is_sam3_backend() and not _is_sam3_native_backend() and MODEL_STORE.get("sam_automatic_generator") is not None:
+            try:
+                mag = MODEL_STORE.get("sam_automatic_generator")
+                crop_np = image_np[y0:y1, x0:x1]
+                raw = mag.generate(crop_np)
+                remapped: List[Dict[str, Any]] = []
+                for r in raw[: max(1, max_masks * 2)]:
+                    m = r.get("segmentation")
+                    if m is None:
+                        continue
+                    m_crop = (np.array(m) > 0).astype(np.uint8)
+                    if m_crop.size == 0 or int(m_crop.sum()) == 0:
+                        continue
+                    if m_crop.shape != (y1 - y0, x1 - x0):
+                        m_crop = np.array(
+                            Image.fromarray(m_crop * 255).resize((x1 - x0, y1 - y0), Image.NEAREST)
+                        )
+                        m_crop = (m_crop > 0).astype(np.uint8)
+                    full = np.zeros((h, w), dtype=np.uint8)
+                    full[y0:y1, x0:x1] = m_crop
+                    score = float(r.get("predicted_iou", r.get("score", 0.0)) or 0.0)
+                    remapped.append({"mask": full, "score": score})
+                if remapped:
+                    remapped = sorted(remapped, key=lambda x: -float(x.get("score", 0.0)))[:max_masks]
+                    logger.info(
+                        "SAM3 crop-multimask produced %d candidates for box %s (image=%s).",
+                        len(remapped),
+                        box,
+                        image_path,
+                    )
+                    return remapped
+            except Exception as e:
+                logger.debug("SAM3 crop-multimask failed for box %s: %s", box, e)
+
+        predictor.set_image(image_np)
         masks, scores, logits = predictor.predict(
             box=np.array([x0, y0, x1, y1]),
             multimask_output=True,
         )
         results: List[Dict[str, Any]] = []
+
+        def _clip_mask_to_box(mask_arr: np.ndarray) -> np.ndarray:
+            m = (np.array(mask_arr) > 0).astype(np.uint8)
+            if m.shape != (h, w):
+                return np.zeros((h, w), dtype=np.uint8)
+            out = np.zeros_like(m, dtype=np.uint8)
+            out[y0:y1, x0:x1] = m[y0:y1, x0:x1]
+            return out
+
+        seen_signatures: set[tuple[int, int, int, int]] = set()
         if isinstance(masks, np.ndarray) and masks.ndim == 3:
             for i in range(min(len(masks), max_masks)):
-                m = masks[i].astype(np.uint8)
+                m = _clip_mask_to_box(masks[i])
+                area = int(m.sum())
+                if area == 0:
+                    continue
+                ys, xs = np.where(m > 0)
+                sig = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+                if sig in seen_signatures:
+                    continue
+                seen_signatures.add(sig)
                 s = float(scores[i]) if (scores is not None and len(scores) > i) else 1.0
                 results.append({"mask": m, "score": s})
             logger.info("SAM multimask produced %d candidates for box %s (image=%s).", len(results), box, image_path)
             logger.debug("SAM multimask scores: %s", scores.tolist() if hasattr(scores, "tolist") else scores)
         else:
-            m = np.array(masks).astype(np.uint8)
-            s = float(scores) if scores is not None else 1.0
-            results.append({"mask": m, "score": s})
-            logger.info("SAM multimask returned single mask for box %s (score=%.3f)", box, s)
+            m = _clip_mask_to_box(np.array(masks))
+            if int(m.sum()) > 0:
+                s = float(scores) if scores is not None else 1.0
+                results.append({"mask": m, "score": s})
+                logger.info("SAM multimask returned single mask for box %s (score=%.3f)", box, s)
+            else:
+                logger.info("SAM multimask single mask empty after clipping for box %s", box)
+        if not results:
+            # Fallback path when HF SAM3 collapses outside bbox:
+            # 1) try edge-based mask constrained by bbox, 2) fallback to bbox rectangle.
+            try:
+                edge_mask = extract_thin_mask_edges(image_path, [x0, y0, x1, y1])
+                if int(edge_mask.sum()) > 0:
+                    results.append({"mask": edge_mask.astype(np.uint8), "score": 0.15})
+                    logger.warning(
+                        "SAM multimask produced 0 usable masks for box %s -> fallback edge mask used",
+                        box,
+                    )
+                else:
+                    raise RuntimeError("edge mask empty")
+            except Exception:
+                fallback = np.zeros((h, w), dtype=np.uint8)
+                fallback[y0:y1, x0:x1] = 1
+                results.append({"mask": fallback, "score": 0.05})
+                logger.warning(
+                    "SAM multimask produced 0 usable masks for box %s -> fallback bbox mask used",
+                    box,
+                )
         return results
     except Exception as e:
         logger.exception("SAM multimask failed: %s", e)
@@ -390,6 +605,67 @@ def compute_edge_alignment_score(image_path: str, mask: np.ndarray) -> float:
         return float(overlap.sum()) / float(boundary_count)
 
 
+def run_text_guided_segmentation_native(
+    image_path: str,
+    text_prompts: List[str],
+    score_threshold: float = 0.3,
+) -> List[Dict[str, Any]]:
+    """Text segmentation via official Meta SAM3 (set_text_prompt), without HF pipeline."""
+    mag = MODEL_STORE.get("sam_automatic_generator")
+    if mag is None:
+        logger.warning("Official SAM3 generator not loaded.")
+        return []
+
+    try:
+        image_np = np.array(Image.open(image_path).convert("RGB"))
+    except Exception as e:
+        logger.exception("Failed to open image for native SAM3: %s", e)
+        return []
+
+    results: List[Dict[str, Any]] = []
+    for prompt in text_prompts:
+        prompt_l = str(prompt).lower()
+        is_rope_like = any(k in prompt_l for k in ["rope", "hawser", "cable", "wire"])
+        try:
+            proposals = mag.generate(image_np, text_prompt=str(prompt))
+        except Exception as e:
+            logger.exception("Official SAM3 text prompt failed for '%s': %s", prompt, e)
+            proposals = []
+
+        for prop in proposals:
+            score = float(prop.get("score", 0.0))
+            if score < score_threshold:
+                continue
+            mask = prop.get("mask") or prop.get("segmentation")
+            bbox = prop.get("bbox")
+            if mask is None or bbox is None:
+                continue
+            try:
+                mask_pp = _postprocess_mask(mask, bbox, is_rope_like=is_rope_like)
+            except Exception:
+                mask_pp = (np.asarray(mask) > 0).astype(np.uint8)
+            if int(mask_pp.sum()) == 0:
+                continue
+            results.append(
+                {
+                    "prompt": prompt,
+                    "bbox": [int(v) for v in bbox],
+                    "score": score,
+                    "mask": mask_pp,
+                    "label": prompt,
+                    "meta": {"sam_backend": "native"},
+                }
+            )
+
+    results = _dedupe_overlapping_masks(results, iou_thr=0.85)
+    logger.info(
+        "Official SAM3 text segmentation: %d masks for %s",
+        len(results),
+        Path(image_path).name,
+    )
+    return results
+
+
 def run_text_guided_segmentation(
     image_path: str,
     text_prompts: List[str],
@@ -397,12 +673,25 @@ def run_text_guided_segmentation(
     max_boxes_per_prompt: int = 10,
     sam_multimask_k: int = 3,
 ) -> List[Dict[str, Any]]:
+    prompts = [str(p).strip() for p in (text_prompts or []) if str(p).strip()]
+    if _is_sam3_native_backend() and MODEL_STORE.get("sam_automatic_generator") is not None:
+        native_results = run_text_guided_segmentation_native(
+            image_path,
+            prompts,
+            score_threshold=score_threshold,
+        )
+        if native_results:
+            return native_results
+        logger.warning(
+            "Official SAM3 returned 0 masks for %s; falling back to GND+SAM path.",
+            Path(image_path).name,
+        )
 
     results: List[Dict[str, Any]] = []
 
     has_clip = MODEL_STORE.get("clip_model") is not None and MODEL_STORE.get("clip_preprocess") is not None
 
-    for prompt in text_prompts:
+    for prompt in prompts:
         prompt_l = str(prompt).lower()
         is_rope_like = any(k in prompt_l for k in ["rope", "hawser", "cable", "wire"])
         try:
@@ -415,18 +704,27 @@ def run_text_guided_segmentation(
 
         if not boxes:
             if MODEL_STORE.get("sam_automatic_generator") is not None:
-                proposals = run_inference_sam_auto(image_path, max_masks=MAX_MASKS_PER_IMAGE)
-                for p in proposals:
-                    results.append(
-                        {
-                            "prompt": prompt,
-                            "bbox": p["bbox"],
-                            "score": float(p.get("score", 0.0)),
-                            "mask": p["mask"],
-                            "label": prompt,
-                        }
-                    )
-                logger.info("Prompt '%s': used SAM auto proposals, added %d proposals", prompt, len(proposals))
+                proposals = run_inference_sam_auto(
+                    image_path,
+                    max_masks=min(MAX_MASKS_PER_IMAGE, 8),
+                    text_prompt=prompt,
+                )
+                if proposals:
+                    best_prop = max(proposals, key=lambda x: float(x.get("score", 0.0)))
+                    p_score = float(best_prop.get("score", 0.0))
+                    if p_score >= max(0.15, score_threshold * 0.7):
+                        p_mask = _postprocess_mask(best_prop["mask"], best_prop["bbox"], is_rope_like=is_rope_like)
+                        if int(p_mask.sum()) > 0:
+                            results.append(
+                                {
+                                    "prompt": prompt,
+                                    "bbox": best_prop["bbox"],
+                                    "score": p_score,
+                                    "mask": p_mask,
+                                    "label": prompt,
+                                }
+                            )
+                logger.info("Prompt '%s': used SAM auto fallback (top-1) from %d proposals", prompt, len(proposals))
             else:
                 logger.info("Prompt '%s': no boxes found and SAM auto not available", prompt)
             continue
@@ -545,23 +843,13 @@ def run_text_guided_segmentation(
                 continue
 
             try:
-                if cv2 is not None:
-                    mask_u8 = (best_mask > 0).astype(np.uint8) * 255
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
-                    nb_components, output, stats, centroids = cv2.connectedComponentsWithStats(
-                        mask_u8, connectivity=8
-                    )
-                    final_mask = np.zeros_like(mask_u8)
-                    for i in range(1, nb_components):
-                        area = stats[i, cv2.CC_STAT_AREA]
-                        if area >= 20:
-                            final_mask[output == i] = 255
-                    best_mask = (final_mask > 0).astype(np.uint8)
-                else:
-                    best_mask = (best_mask > 0).astype(np.uint8)
+                best_mask = _postprocess_mask(best_mask, bbox, is_rope_like=is_rope_like)
             except Exception:
                 best_mask = (best_mask > 0).astype(np.uint8)
+
+            if int(best_mask.sum()) == 0:
+                logger.debug("Postprocessed mask became empty for bbox=%s (prompt=%s)", bbox, prompt)
+                continue
 
             results.append(
                 {
@@ -576,5 +864,6 @@ def run_text_guided_segmentation(
             logger.info("Selected mask for prompt '%s' bbox=%s score=%.3f area=%d meta=%s",
                         prompt, bbox, float(best_score), int(best_mask.sum()), best_meta or {})
 
+    results = _dedupe_overlapping_masks(results, iou_thr=0.85)
     logger.info("Text-guided segmentation yielded %d masks for %s", len(results), Path(image_path).name)
     return results

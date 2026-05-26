@@ -16,10 +16,31 @@ logger = logging.getLogger("preann_service")
 QWEN_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
 QWEN_MAX_NEW_TOKENS = int(os.environ.get("QWEN_MAX_NEW_TOKENS", "256"))
 QWEN_MAX_TIME_S = float(os.environ.get("QWEN_MAX_TIME_S", "25"))
+QWEN_MAX_IMAGE_PIXELS = int(os.environ.get("QWEN_MAX_IMAGE_PIXELS", str(1024 * 1024)))
 
 _QWEN_MODEL = None
 _QWEN_PROCESSOR = None
 _QWEN_LOADED = False
+_QWEN_DISABLED_REASON = ""
+
+
+def _prepare_image_for_qwen(image: Image.Image) -> Image.Image:
+    w, h = image.size
+    pixels = w * h
+    if pixels <= QWEN_MAX_IMAGE_PIXELS:
+        return image
+    scale = (QWEN_MAX_IMAGE_PIXELS / float(pixels)) ** 0.5
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    logger.info(
+        "Qwen image resized from %sx%s to %sx%s due to QWEN_MAX_IMAGE_PIXELS=%s",
+        w,
+        h,
+        new_w,
+        new_h,
+        QWEN_MAX_IMAGE_PIXELS,
+    )
+    return image.resize((new_w, new_h), Image.BILINEAR)
 
 
 def _extract_json_object(text: str) -> Optional[dict]:
@@ -69,6 +90,23 @@ def _normalize_list(value: Any, fallback: List[str]) -> List[str]:
             pass
         return [x.strip() for x in v.replace(",", "\n").splitlines() if x.strip()] or fallback
     return fallback
+
+
+def _ensure_detailed_prompts(class_names: List[str], text_prompts: List[str]) -> List[str]:
+    """
+    Keep one stable, non-empty prompt per class.
+    This is used by api fallback paths and must stay import-compatible.
+    """
+    classes = _normalize_list(class_names, ["object"])
+    prompts = _normalize_list(text_prompts, classes)
+    out: List[str] = []
+    for i, cls in enumerate(classes):
+        base = prompts[i] if i < len(prompts) else cls
+        p = str(base).strip()
+        if not p:
+            p = str(cls).strip() or "object"
+        out.append(p)
+    return out
 
 
 def ensure_qwen_loaded() -> bool:
@@ -122,6 +160,16 @@ def qwen_suggest_prompts(
     fallback_classes = class_names or ["object"]
     fallback_prompts = fallback_classes
 
+    global _QWEN_DISABLED_REASON
+    if _QWEN_DISABLED_REASON:
+        logger.warning("Qwen disabled, using fallback: %s", _QWEN_DISABLED_REASON)
+        return {
+            "class_names": fallback_classes,
+            "text_prompts": fallback_prompts,
+            "raw_text": "",
+            "source": "fallback",
+        }
+
     if not ensure_qwen_loaded():
         logger.info("Qwen suggest fallback (not loaded) in %.2fs", time.time() - t0)
         return {
@@ -153,6 +201,7 @@ def qwen_suggest_prompts(
         QWEN_MAX_NEW_TOKENS,
     )
     image = Image.open(image_path).convert("RGB")
+    image = _prepare_image_for_qwen(image)
     instruction = (user_instruction or "").strip()
     if not instruction:
         instruction = (
@@ -234,6 +283,10 @@ def qwen_suggest_prompts(
         }
 
     except Exception as e:
+        msg = str(e)
+        if "Invalid buffer size" in msg or "CUDA out of memory" in msg:
+            _QWEN_DISABLED_REASON = f"memory pressure during generate: {msg}"
+            logger.warning("Qwen disabled for next requests due to OOM-like error.")
         logger.exception("Qwen prompt suggestion failed: %s", e)
         logger.info("Qwen suggest fallback (exception) in %.2fs", time.time() - t0)
         return {

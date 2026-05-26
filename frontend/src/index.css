@@ -184,6 +184,17 @@ select {
   display: flex;
   flex-direction: column;
   gap: 18px;
+  position: relative;
+}
+
+.panel-fieldset {
+  margin: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.panel-fieldset:disabled {
+  opacity: 1;
 }
 
 .field label {
@@ -351,6 +362,11 @@ select {
   border-color: var(--accent);
 }
 
+.btn-secondary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .dropzone {
   border: 2px dashed var(--border-strong);
   border-radius: var(--radius);
@@ -514,6 +530,20 @@ select {
   border-top-color: #ffffff;
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
+}
+
+.spinner-inline {
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
+  border-color: rgba(146, 64, 14, 0.35);
+  border-top-color: #92400e;
+}
+
+.alert-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 @keyframes spin {

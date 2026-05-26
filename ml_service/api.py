@@ -15,16 +15,29 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from PIL import Image
+try:
+    import cv2  # type: ignore
+except Exception:
+    cv2 = None  # type: ignore[assignment]
 
 try:
     from pycocotools import mask as mask_utils  # type: ignore
 except Exception:
     mask_utils = None  # type: ignore[assignment]
 
-from .qwen_llm import qwen_suggest_prompts, ensure_qwen_loaded, QWEN_MODEL_ID
+from .qwen_llm import (
+    qwen_suggest_prompts,
+    ensure_qwen_loaded,
+    QWEN_MODEL_ID,
+    _ensure_detailed_prompts,
+)
 from .models import (
     MODEL_STORE,
     SAM_CHECKPOINT,
+    SAM_BACKEND,
+    SAM3_BACKENDS,
+    SAM3_MODEL_ID,
+    MODEL_STORE,
     GND_DINO_CHECKPOINT,
     GND_DINO_CONFIG,
     MAX_MASKS_PER_IMAGE,
@@ -38,7 +51,7 @@ from .inference import (
 )
 
 
-app = FastAPI(title="Preannotation Service (auto: GroundingDINO/SAM)")
+app = FastAPI(title="Preannotation Service (auto: SAM/SAM3)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,18 +61,118 @@ app.add_middleware(
 )
 
 
+def _is_sam3_backend() -> bool:
+    return SAM_BACKEND in SAM3_BACKENDS
+
+
+def _strategy_name(base: str) -> str:
+    """
+    Return strategy name adjusted for active SAM backend.
+    Keeps old names for classic SAM and exposes explicit sam3 names for HF SAM3.
+    """
+    if not _is_sam3_backend():
+        return base
+    mapping = {
+        "gnd+sam": "gnd+sam3",
+        "gnd+sam-text": "gnd+sam3-text",
+    }
+    return mapping.get(base, base)
+
+
 def create_coco_structure(images_info, annotations, categories):
     return {"images": images_info, "annotations": annotations, "categories": categories}
 
+
+def _render_preview_with_masks(
+    image: Image.Image,
+    anns_for_image: List[Dict[str, Any]],
+    categories: List[Dict[str, Any]],
+    masks_dir: Path,
+    *,
+    default_outline: tuple[int, int, int, int] = (255, 0, 0, 220),
+) -> Image.Image:
+    """Render preview close to CVAT: semi-transparent masks, then bbox + labels on top."""
+    preview = image.copy().convert("RGBA")
+    base_arr = np.array(preview).astype(np.float32)
+    overlay = np.zeros_like(base_arr, dtype=np.float32)
+    alpha = np.zeros((base_arr.shape[0], base_arr.shape[1]), dtype=np.float32)
+    from PIL import ImageDraw
+
+    color_palette = [
+        (255, 64, 64),
+        (64, 160, 255),
+        (64, 200, 120),
+        (255, 196, 64),
+        (180, 100, 255),
+    ]
+    cat_colors: Dict[int, tuple[int, int, int]] = {}
+
+    for ann in anns_for_image:
+        cat_id = int(ann.get("category_id", 1))
+        if cat_id not in cat_colors:
+            cat_colors[cat_id] = color_palette[(cat_id - 1) % len(color_palette)]
+        rgb = cat_colors[cat_id]
+
+        mask_rel = ann.get("mask_path")
+        if isinstance(mask_rel, str) and mask_rel.strip():
+            mp = masks_dir / Path(mask_rel).name
+            if mp.exists():
+                try:
+                    m = (np.array(Image.open(mp).convert("L")) > 0).astype(np.uint8)
+                    if m.shape == alpha.shape:
+                        overlay[m > 0, 0] = rgb[0]
+                        overlay[m > 0, 1] = rgb[1]
+                        overlay[m > 0, 2] = rgb[2]
+                        alpha[m > 0] = np.maximum(alpha[m > 0], 0.35)
+                except Exception:
+                    pass
+
+    out = base_arr.copy()
+    if alpha.max() > 0:
+        for c in range(3):
+            out[..., c] = out[..., c] * (1.0 - alpha) + overlay[..., c] * alpha
+        out[..., 3] = base_arr[..., 3]
+    preview = Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="RGBA")
+
+    draw = ImageDraw.Draw(preview)
+    for ann in anns_for_image:
+        cat_id = int(ann.get("category_id", 1))
+        x, y, w_box, h_box = ann["bbox"]
+        draw.rectangle([x, y, x + w_box, y + h_box], outline=default_outline, width=2)
+        cat_name = next((c["name"] for c in categories if c["id"] == cat_id), "")
+        if cat_name:
+            draw.text((x + 3, y + 3), cat_name, fill=(255, 255, 255, 230))
+    return preview
+
 def _mask_to_coco_segmentation(mask: np.ndarray) -> tuple[dict[str, Any] | list, int]:
     """
-    Convert binary mask (0/1) to COCO RLE segmentation dict + area.
-    CVAT COCO importer expects valid `segmentation` (RLE or polygons) for masks.
+    Convert binary mask (0/1) to COCO segmentation + area.
+    Prefer polygons for CVAT compatibility, fallback to RLE if needed.
     """
     m = (mask > 0).astype(np.uint8)
     area = int(m.sum())
     if area <= 0:
         return [], 0
+    if cv2 is not None:
+        try:
+            contours, _ = cv2.findContours(
+                (m * 255).astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            polygons: list[list[float]] = []
+            for cnt in contours:
+                if cnt is None or len(cnt) < 3:
+                    continue
+                if cv2.contourArea(cnt) < 8.0:
+                    continue
+                coords = cnt.reshape(-1, 2).astype(float).flatten().tolist()
+                if len(coords) >= 6:
+                    polygons.append(coords)
+            if polygons:
+                return polygons, area
+        except Exception:
+            pass
     if mask_utils is None:
         # Fallback: cannot encode RLE -> no segmentation (will be treated as bbox-only)
         return [], area
@@ -142,6 +255,26 @@ def _parse_text_prompts(data: Dict[str, Any], fallback: Optional[List[str]] = No
     return text_prompts
 
 
+def _norm_name(v: str) -> str:
+    return " ".join(str(v).strip().lower().replace("_", " ").split())
+
+
+def _match_label_to_class(label: str, class_names: List[str]) -> str:
+    if not class_names:
+        return "object"
+    if not label:
+        return class_names[0]
+    label_n = _norm_name(label)
+    by_norm = {_norm_name(c): c for c in class_names}
+    if label_n in by_norm:
+        return by_norm[label_n]
+    for c in class_names:
+        cn = _norm_name(c)
+        if cn and (cn in label_n or label_n in cn):
+            return c
+    return class_names[0]
+
+
 def _apply_qwen_suggestions(
     *,
     use_qwen: bool,
@@ -155,6 +288,9 @@ def _apply_qwen_suggestions(
         return class_names, text_prompts
 
     try:
+        original_classes = _normalize_list(class_names, ["object"])
+        original_prompts = _normalize_list(text_prompts, original_classes)
+
         qwen_result = qwen_suggest_prompts(
             image_paths[0],
             qwen_instruction or "Suggest annotation classes and text prompts for this image.",
@@ -164,8 +300,29 @@ def _apply_qwen_suggestions(
         suggested_classes = qwen_result.get("class_names") or class_names
         suggested_prompts = qwen_result.get("text_prompts") or text_prompts
 
-        class_names = _normalize_list(suggested_classes, class_names)
-        text_prompts = _normalize_list(suggested_prompts, suggested_classes if suggested_classes else class_names)
+        qwen_classes = _normalize_list(suggested_classes, original_classes)
+        qwen_prompts = _normalize_list(
+            suggested_prompts, qwen_classes if qwen_classes else original_prompts
+        )
+
+        # Keep task labels stable for CVAT import; use Qwen only to improve text prompts.
+        class_names = original_classes
+        best_prompts_by_class: Dict[str, str] = {}
+
+        for cls, pr in zip(qwen_classes, qwen_prompts):
+            mapped = _match_label_to_class(cls, class_names)
+            cur = best_prompts_by_class.get(mapped, "")
+            if not cur or len(str(pr)) > len(cur):
+                best_prompts_by_class[mapped] = str(pr)
+
+        # Ensure one prompt per class and avoid duplicates.
+        text_prompts = [
+            best_prompts_by_class.get(c, original_prompts[i] if i < len(original_prompts) else c)
+            for i, c in enumerate(class_names)
+        ]
+
+        if str(qwen_result.get("source", "")).lower() == "fallback":
+            text_prompts = _ensure_detailed_prompts(class_names, text_prompts)
 
         logger.info(
             "Qwen suggestions applied: classes=%s prompts=%s source=%s",
@@ -236,10 +393,23 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
     has_clip = MODEL_STORE.get("clip_model") is not None and MODEL_STORE.get("clip_preprocess") is not None
 
     if task_type == "detection":
-        strategy = "gnd-only"
+        if text_prompts and (has_gnd or has_sam):
+            strategy = _strategy_name("gnd+sam-text")
+        elif has_gnd:
+            strategy = "gnd-only"
+        elif has_sam_auto:
+            strategy = "sam-auto"
+        elif has_sam:
+            strategy = "sam-predictor-only"
+        else:
+            strategy = "stub"
     elif task_type == "segmentation":
-        if effective_seg_prompts and (has_gnd or has_sam):
-            strategy = "gnd+sam-text"
+        if has_gnd and has_sam:
+            strategy = _strategy_name("gnd+sam-text")
+        elif _is_sam3_backend() and has_sam:
+            strategy = "sam3-text"
+        elif effective_seg_prompts and (has_gnd or has_sam):
+            strategy = _strategy_name("gnd+sam-text")
         elif has_sam_auto:
             strategy = "sam-auto"
         elif has_sam:
@@ -248,10 +418,19 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
             strategy = "stub"
         use_clip_flag = False
     elif task_type == "classification":
-        strategy = "gnd-only"
+        if text_prompts and (has_gnd or has_sam):
+            strategy = _strategy_name("gnd+sam-text")
+        elif has_gnd:
+            strategy = "gnd-only"
+        elif has_sam_auto:
+            strategy = "sam-auto"
+        elif has_sam:
+            strategy = "sam-predictor-only"
+        else:
+            strategy = "stub"
     else:
         if has_gnd and has_sam:
-            strategy = "gnd+sam"
+            strategy = _strategy_name("gnd+sam")
         elif has_gnd:
             strategy = "gnd-only"
         elif has_sam_auto:
@@ -273,13 +452,8 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
     annotations: List[Dict[str, Any]] = []
     images_info: List[Dict[str, Any]] = []
 
+    # Keep categories strictly aligned with task labels for reliable CVAT import.
     categories = [{"id": i + 1, "name": name} for i, name in enumerate(class_names)]
-    existing_cat_names = {c["name"] for c in categories}
-    extra_prompts: List[str] = effective_seg_prompts if task_type == "segmentation" else text_prompts
-    for tp in extra_prompts:
-        if tp not in existing_cat_names:
-            categories.append({"id": len(categories) + 1, "name": tp})
-            existing_cat_names.add(tp)
     name_to_catid = {c["name"]: c["id"] for c in categories}
 
     ann_id = 1
@@ -303,7 +477,9 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
         if task_type == "segmentation" and effective_seg_prompts:
             use_text_guided = True
             prompts_for_this = effective_seg_prompts
-        elif task_type != "segmentation" and text_prompts:
+        elif task_type in ("detection", "classification", "other") and text_prompts and (
+            has_gnd or has_sam
+        ):
             use_text_guided = True
             prompts_for_this = text_prompts
 
@@ -333,9 +509,10 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
                     mimg = Image.fromarray((mask * 255).astype(np.uint8))
                     mimg.save(mask_path)
                 x0, y0, x1, y1 = bbox
-                fallback_label = prompts_for_this[0]
+                fallback_label = class_names[0] if class_names else "object"
+                mapped_label = _match_label_to_class(str(label), class_names)
                 cat_id = name_to_catid.get(
-                    label, name_to_catid.get(fallback_label, 1)
+                    mapped_label, name_to_catid.get(fallback_label, 1)
                 )
                 segmentation, area = _mask_to_coco_segmentation(mask)
                 ann = {
@@ -352,7 +529,7 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
                 annotations.append(ann)
                 ann_id += 1
         else:
-            if strategy in ("gnd-only", "gnd+sam"):
+            if strategy in ("gnd-only", "gnd+sam", "gnd+sam3"):
                 boxes_all: List[Dict[str, Any]] = []
                 for cname in class_names:
                     try:
@@ -485,26 +662,14 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
                 ann_id += 1
 
         try:
-            preview = img.copy().convert("RGBA")
-            from PIL import ImageDraw
-
-            draw = ImageDraw.Draw(preview)
-            for a in annotations:
-                if a["image_id"] == img_id:
-                    x, y, w_box, h_box = a["bbox"]
-                    draw.rectangle(
-                        [x, y, x + w_box, y + h_box],
-                        outline=(255, 0, 0, 200),
-                        width=3,
-                    )
-                    cat_id = a.get("category_id", 1)
-                    cat_name = next(
-                        (c["name"] for c in categories if c["id"] == cat_id),
-                        "",
-                    )
-                    draw.text(
-                        (x + 3, y + 3), cat_name, fill=(255, 255, 255, 220)
-                    )
+            anns_for_img = [a for a in annotations if a["image_id"] == img_id]
+            preview = _render_preview_with_masks(
+                img,
+                anns_for_img,
+                categories,
+                masks_dir,
+                default_outline=(255, 0, 0, 220),
+            )
             preview_path = previews_dir / f"{p_path.stem}_preview.png"
             max_w = 800
             if preview.width > max_w:
@@ -658,26 +823,14 @@ async def segment_by_text(payload: str = Form(...), images: List[UploadFile] = F
             ann_id += 1
 
         try:
-            preview = img.copy().convert("RGBA")
-            from PIL import ImageDraw
-
-            draw = ImageDraw.Draw(preview)
-            for a in annotations:
-                if a["image_id"] == img_id:
-                    x, y, w_box, h_box = a["bbox"]
-                    draw.rectangle(
-                        [x, y, x + w_box, y + h_box],
-                        outline=(0, 255, 0, 200),
-                        width=2,
-                    )
-                    cat_id = a.get("category_id", 1)
-                    cat_name = next(
-                        (c["name"] for c in categories if c["id"] == cat_id),
-                        "",
-                    )
-                    draw.text(
-                        (x + 3, y + 3), cat_name, fill=(255, 255, 255, 220)
-                    )
+            anns_for_img = [a for a in annotations if a["image_id"] == img_id]
+            preview = _render_preview_with_masks(
+                img,
+                anns_for_img,
+                categories,
+                masks_dir,
+                default_outline=(0, 255, 0, 220),
+            )
             preview_path = previews_dir / f"{Path(p).stem}_preview.png"
             max_w = 800
             if preview.width > max_w:
@@ -724,10 +877,11 @@ def health():
     has_sam = MODEL_STORE.get("sam_predictor") is not None
     has_sam_auto = MODEL_STORE.get("sam_automatic_generator") is not None
 
-    sam_ck_exists = bool(SAM_CHECKPOINT and Path(SAM_CHECKPOINT).exists())
+    using_local_sam_checkpoint = not _is_sam3_backend()
+    sam_ck_exists = bool(SAM_CHECKPOINT and Path(SAM_CHECKPOINT).exists()) if using_local_sam_checkpoint else False
     gnd_ck_exists = bool(GND_DINO_CHECKPOINT and Path(GND_DINO_CHECKPOINT).exists())
 
-    from .models import CLIP_AVAILABLE, CLIP_BACKEND
+    from .models import CLIP_AVAILABLE, CLIP_BACKEND, GND_DINO_CUDA_OPS, GND_DINO_LAST_ERROR
 
     clip_pkg_installed = bool("CLIP_AVAILABLE" in globals() and CLIP_AVAILABLE)
     clip_model_loaded = MODEL_STORE.get("clip_model") is not None
@@ -746,9 +900,13 @@ def health():
 
     return {
         "status": "ok",
+        "api_module_file": __file__,
+        "models_module_file": __import__("ml_service.models", fromlist=["__file__"]).__file__,
         "strategy_suggested": (
-            "gnd+sam"
+            _strategy_name("gnd+sam")
             if has_gnd and has_sam
+            else "sam3-text"
+            if _is_sam3_backend() and has_sam
             else "gnd-only"
             if has_gnd
             else "sam-auto"
@@ -758,11 +916,17 @@ def health():
             else "stub"
         ),
         "groundingdino_available": has_gnd,
+        "groundingdino_cuda_ops": GND_DINO_CUDA_OPS,
+        "groundingdino_last_error": GND_DINO_LAST_ERROR,
         "sam_predictor_available": has_sam,
         "sam_automatic_generator_available": has_sam_auto,
         "sam_checkpoint_exists": sam_ck_exists,
+        "sam_checkpoint_used": using_local_sam_checkpoint,
         "groundingdino_checkpoint_exists": gnd_ck_exists,
-        "sam_checkpoint_path": SAM_CHECKPOINT,
+        "sam_checkpoint_path": SAM_CHECKPOINT if using_local_sam_checkpoint else None,
+        "sam_backend": SAM_BACKEND,
+        "sam3_load_mode": MODEL_STORE.get("sam_backend_mode"),
+        "sam3_model_id": SAM3_MODEL_ID,
         "groundingdino_checkpoint_path": GND_DINO_CHECKPOINT,
         "groundingdino_config_path": GND_DINO_CONFIG,
         "clip_package_installed": clip_pkg_installed,

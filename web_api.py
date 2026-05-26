@@ -188,12 +188,18 @@ def _run_preannotation_for_task(task_id: int, local_paths: list[str], payload: d
             opened_files.append(fobj)
             files.append(("images", (Path(p).name, fobj, "image/jpeg")))
 
+        classes = payload.get("classes") or []
+        if not isinstance(classes, list):
+            classes = [str(classes)]
+        classes = [str(c).strip() for c in classes if str(c).strip()]
+        task_type = str(payload.get("task_type", "detection"))
         ml_payload = {
             "score_threshold": float(payload.get("score_threshold", 0.3)),
             "max_boxes": int(payload.get("max_boxes", 10)),
             "format": "coco",
-            "task_type": str(payload.get("task_type", "detection")),
-            "class_names": payload.get("classes", []),
+            "task_type": task_type,
+            "class_names": classes,
+            "text_prompts": classes if task_type == "segmentation" else (payload.get("text_prompts") or []),
             "use_clip": bool(payload.get("use_clip", False)),
             "use_qwen": bool(payload.get("use_qwen", False)),
             "qwen_instruction": str(payload.get("qwen_instruction", "")),
@@ -374,6 +380,28 @@ def preannotation_status(task_id: int = FPath(..., ge=1)) -> dict[str, Any]:
 def export_task(task_id: int = FPath(..., ge=1), body: ExportBody = ExportBody()) -> FileResponse:
     safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in body.task_name).strip("_") or "task"
     out_zip = EXPORT_DIR / f"{safe_name}_{task_id}_{int(time.time())}.zip"
+
+    def _local_preann_fallback() -> Path | None:
+        with _STATUS_LOCK:
+            st = dict(_PREANN_STATUS.get(task_id, {}))
+        archive_path_raw = st.get("archive_path")
+        if isinstance(archive_path_raw, str) and archive_path_raw.strip():
+            candidate = Path(archive_path_raw)
+            if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate
+
+        # Process may have restarted and in-memory status can be empty:
+        # pick the newest local preannotation archive for this task id.
+        candidates = sorted(
+            PREANN_DIR.glob(f"preann_task_{task_id}_*.zip"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+            reverse=True,
+        )
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate
+        return None
+
     try:
         exported = export_annotations_by_id(
             task_id=int(task_id),
@@ -382,6 +410,21 @@ def export_task(task_id: int = FPath(..., ge=1), body: ExportBody = ExportBody()
             include_images=body.include_images,
         )
     except Exception as e:
+        # Fallback: if CVAT export is unavailable (e.g. org/task visibility mismatch),
+        # return the already generated ML preannotation archive for this task.
+        archive_path = _local_preann_fallback()
+        if archive_path is not None:
+            logger.warning(
+                "task=%s CVAT export failed (%s); fallback to preannotation archive %s",
+                task_id,
+                e,
+                archive_path,
+            )
+            return FileResponse(
+                path=archive_path,
+                media_type="application/zip",
+                filename=f"{safe_name}_{task_id}_preannotation.zip",
+            )
         raise HTTPException(status_code=500, detail=f"Export failed: {e}")
 
     file_path = Path(exported)

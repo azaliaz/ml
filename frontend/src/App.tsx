@@ -4,7 +4,7 @@
  * Статичные демо-кадры до запуска — опционально: SHOW_MARKETING_SAMPLES + файлы в public/marketing/.
  * Подробно: src/assets/DESIGN_ASSETS.md
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { HeroIllustration } from "./components/illustrations/HeroIllustration";
 import { UploadEmptyIllustration } from "./components/illustrations/UploadEmptyIllustration";
 
@@ -65,10 +65,12 @@ function Toggle({
   checked,
   onChange,
   label,
+  disabled = false,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   label: string;
+  disabled?: boolean;
 }) {
   return (
     <div className="toggle-row">
@@ -78,6 +80,7 @@ function Toggle({
         className="switch"
         role="switch"
         aria-checked={checked}
+        disabled={disabled}
         onClick={() => onChange(!checked)}
       />
     </div>
@@ -107,6 +110,8 @@ export function App() {
   const [preannStatus, setPreannStatus] = useState<string | null>(null);
 
   const [mlHealth, setMlHealth] = useState<MlHealth | null>(null);
+  const [mlHealthState, setMlHealthState] = useState<"checking" | "ok" | "degraded" | "down">("checking");
+  const mlHealthFailuresRef = useRef(0);
 
   const [exportFormat, setExportFormat] = useState<string>("COCO 1.0");
   const [includeImages, setIncludeImages] = useState(false);
@@ -117,11 +122,26 @@ export function App() {
   const [grantLoading, setGrantLoading] = useState(false);
   const [grantMessage, setGrantMessage] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
-  const refreshMlHealth = useCallback(() => {
-    fetch("/api/ml/health")
-      .then((r) => r.json())
-      .then((d: MlHealth) => setMlHealth(d))
-      .catch(() => setMlHealth({ ok: false, error: "Сеть" }));
+  const refreshMlHealth = useCallback(async () => {
+    try {
+      const r = await fetch("/api/ml/health");
+      const d = (await r.json()) as MlHealth;
+      if (!r.ok || d.ok !== true) {
+        throw new Error(d.error || `status ${r.status}`);
+      }
+      mlHealthFailuresRef.current = 0;
+      setMlHealth(d);
+      setMlHealthState("ok");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Сеть";
+      mlHealthFailuresRef.current += 1;
+      setMlHealth((prev) => prev ?? { ok: false, error: msg });
+      setMlHealthState((prev) => {
+        if (prev === "ok" && mlHealthFailuresRef.current < 3) return "degraded";
+        if (prev === "checking") return "down";
+        return mlHealthFailuresRef.current >= 3 ? "down" : prev;
+      });
+    }
   }, []);
 
   useEffect(() => {
@@ -140,6 +160,7 @@ export function App() {
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragActive(false);
+    if (preannotationInProgress) return;
     if (e.dataTransfer.files?.length) onFiles(e.dataTransfer.files);
   };
 
@@ -194,6 +215,10 @@ export function App() {
   };
 
   const taskId = uploadResult?.task_id;
+  const preannotationInProgress =
+    uploading ||
+    preannStatus === "processing" ||
+    uploadResult?.preannotation?.status === "processing";
 
   useEffect(() => {
     if (!taskId) return;
@@ -348,20 +373,14 @@ export function App() {
           </div>
           <HeroIllustration />
         </div>
-        <div
-          className="health-pill"
-          data-ok={mlHealth?.ok === true ? "true" : "false"}
-          title={mlHealth?.ok ? JSON.stringify(mlHealth.data) : mlHealth?.error}
-        >
-          <span className="health-dot" />
-          {mlHealth?.ok === true ? "ML-сервис доступен" : mlHealth == null ? "Проверка…" : "ML-сервис недоступен"}
-        </div>
+        {/* Временно скрыто по запросу:
+            индикатор доступности ML-сервиса. */}
       </header>
 
       <div className="layout-grid">
         <aside className="panel">
           <div className="panel-header">Параметры модели</div>
-          <div className="panel-body">
+          <fieldset className="panel-body panel-fieldset" disabled={preannotationInProgress}>
             <div className="field">
               <label htmlFor="task-type">Тип задачи</label>
               <select
@@ -440,8 +459,8 @@ export function App() {
               </div>
             </div>
 
-            <Toggle checked={useClip} onChange={setUseClip} label="CLIP (фильтрация, если доступен)" />
-            <Toggle checked={useQwen} onChange={setUseQwen} label="Qwen — промпты" />
+            <Toggle checked={useClip} onChange={setUseClip} label="CLIP (фильтрация, если доступен)" disabled={preannotationInProgress} />
+            <Toggle checked={useQwen} onChange={setUseQwen} label="Qwen — промпты" disabled={preannotationInProgress} />
 
             {useQwen ? (
               <div className="field">
@@ -460,8 +479,9 @@ export function App() {
               checked={runPreannot}
               onChange={setRunPreannot}
               label="Предразметка перед импортом в CVAT"
+              disabled={preannotationInProgress}
             />
-          </div>
+          </fieldset>
         </aside>
 
         <main className="panel">
@@ -471,10 +491,14 @@ export function App() {
               className="dropzone"
               data-active={dragActive}
               onDragOver={(e) => {
+                if (preannotationInProgress) return;
                 e.preventDefault();
                 setDragActive(true);
               }}
-              onDragLeave={() => setDragActive(false)}
+              onDragLeave={() => {
+                if (preannotationInProgress) return;
+                setDragActive(false);
+              }}
               onDrop={onDrop}
             >
               {/* Пустое состояние: иллюстрация — править в components/illustrations/UploadEmptyIllustration.tsx */}
@@ -488,8 +512,10 @@ export function App() {
                       type="file"
                       accept=".jpg,.jpeg,.png,.bmp,.tif,.tiff"
                       multiple
+                      disabled={preannotationInProgress}
                       hidden
                       onChange={(e) => {
+                        if (preannotationInProgress) return;
                         if (e.target.files?.length) onFiles(e.target.files);
                         e.target.value = "";
                       }}
@@ -521,6 +547,7 @@ export function App() {
                     <span>{f.name}</span>
                     <button
                       type="button"
+                      disabled={preannotationInProgress}
                       onClick={() => setFiles((prev) => prev.filter((_, j) => j !== i))}
                     >
                       Убрать
@@ -533,7 +560,7 @@ export function App() {
             <button
               type="button"
               className="btn-primary"
-              disabled={uploading}
+              disabled={uploading || preannotationInProgress}
               onClick={handleUpload}
               style={{ width: "100%", marginTop: 12 }}
             >
@@ -564,7 +591,10 @@ export function App() {
                   <>
                     {uploadResult.preannotation.status === "processing" ? (
                       <div className="alert alert-warn" style={{ marginTop: 12 }}>
-                        Предразметка выполняется... Подождите, статус обновляется автоматически.
+                        <span className="alert-inline">
+                          <span className="spinner spinner-inline" aria-hidden />
+                          Предразметка выполняется... Подождите, статус обновляется автоматически.
+                        </span>
                       </div>
                     ) : null}
                     {uploadResult.preannotation.status === "error" ? (
@@ -629,7 +659,7 @@ export function App() {
                   </div>
                 </div>
                 {exportError ? <div className="alert alert-error">{exportError}</div> : null}
-                <button type="button" className="btn-secondary" disabled={exporting} onClick={handleExport}>
+                <button type="button" className="btn-secondary" disabled={exporting || preannotationInProgress} onClick={handleExport}>
                   {exporting ? "Экспорт…" : "Скачать ZIP"}
                 </button>
               </>
@@ -649,9 +679,10 @@ export function App() {
                     value={reviewerUser}
                     onChange={(e) => setReviewerUser(e.target.value)}
                     placeholder="username"
+                    disabled={preannotationInProgress}
                   />
                 </div>
-                <button type="submit" className="btn-secondary" disabled={grantLoading}>
+                <button type="submit" className="btn-secondary" disabled={grantLoading || preannotationInProgress}>
                   {grantLoading ? "Назначение…" : "Назначить валидатора"}
                 </button>
                 {grantMessage ? (
