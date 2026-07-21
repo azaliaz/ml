@@ -23,6 +23,7 @@ CVAT_URL = os.environ.get("CVAT_URL", "http://localhost:8080")
 ACCESS_TOKEN = os.environ.get("CVAT_TOKEN")
 CVAT_INSECURE = os.environ.get("CVAT_INSECURE", "").lower() in ("1", "true", "yes")
 USE_BEARER = os.environ.get("CVAT_TOKEN_BEARER", "").lower() in ("1", "true", "yes")
+CVAT_ORG = (os.environ.get("CVAT_ORG") or "").strip()
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -47,40 +48,159 @@ def _wait_for_task_size(client, task_id: int, expected_count: int, timeout: int 
             return False
         time.sleep(poll_interval)
 
-def create_task_and_upload(local_files: List[str], task_name: str = "streamlit_task", labels: Optional[List[dict]] = None, timeout: int = 600) -> int:
+
+def _wait_for_task_ready(
+    client,
+    task_id: int,
+    *,
+    min_size: int = 1,
+    timeout: int = 600,
+    poll_interval: float = 2.0,
+) -> bool:
+    """Wait until CVAT finishes ingesting media (video decode may take a while)."""
+    start = time.time()
+    last_size = 0
+    while True:
+        task = client.tasks.retrieve(task_id)
+        size = getattr(task, "size", None)
+        try:
+            size_int = int(size) if size is not None else 0
+        except Exception:
+            size_int = 0
+        status = str(getattr(task, "status", "") or "").lower()
+        if size_int >= min_size:
+            if size_int != last_size:
+                logger.info("CVAT task %s ingest progress: size=%d (need>=%d)", task_id, size_int, min_size)
+            return True
+        if status in ("failed", "error"):
+            raise RuntimeError(f"CVAT task {task_id} ingestion failed (status={status})")
+        if size_int != last_size:
+            logger.info("CVAT task %s ingesting: size=%d (waiting for >= %d)", task_id, size_int, min_size)
+            last_size = size_int
+        if time.time() - start > timeout:
+            return False
+        time.sleep(poll_interval)
+
+
+def wait_for_cvat_video_meta(
+    task_id: int,
+    *,
+    min_frames: int = 2,
+    timeout: int = 1800,
+    poll_interval: float = 3.0,
+) -> dict:
+    """Poll data/meta until the video task has at least min_frames (decoded / chunked)."""
+    start = time.time()
+    last_size = 0
+    while time.time() - start < timeout:
+        meta = get_task_data_meta(task_id)
+        size = int(meta.get("size") or 0)
+        if size >= min_frames:
+            logger.info(
+                "CVAT video task %s meta ready: size=%d frames_meta=%d",
+                task_id,
+                size,
+                len(meta.get("frames") or []),
+            )
+            return meta
+        if size != last_size:
+            logger.info(
+                "CVAT video task %s waiting for decode: size=%d (need>=%d)",
+                task_id,
+                size,
+                min_frames,
+            )
+            last_size = size
+        time.sleep(poll_interval)
+    raise TimeoutError(
+        f"CVAT video task {task_id} not ready after {timeout}s (last size={last_size}, need>={min_frames})"
+    )
+
+
+def get_task_data_meta(task_id: int, timeout: int = 30) -> dict:
+    """Fetch frame metainfo for a task (GET /api/tasks/{id}/data/meta)."""
+    url = f"{CVAT_URL.rstrip('/')}/api/tasks/{int(task_id)}/data/meta"
+    session = _build_requests_session()
+    session.headers.update(_auth_headers())
+    resp = session.get(url, timeout=timeout, verify=(not CVAT_INSECURE))
+    if resp.status_code != 200:
+        raise RuntimeError(f"GET {url} failed: status={resp.status_code} body={resp.text[:2000]}")
+    body = resp.json()
+    if not isinstance(body, dict):
+        raise RuntimeError(f"Unexpected data/meta response for task {task_id}: {type(body)}")
+    return body
+
+
+def create_task_and_upload(
+    local_files: List[str],
+    task_name: str = "streamlit_task",
+    labels: Optional[List[dict]] = None,
+    timeout: int = 600,
+    upload_params: Optional[dict] = None,
+    video_min_frames: Optional[int] = None,
+) -> int:
     if not local_files:
         raise ValueError("local_files must contain at least one path")
 
-    logger.info("Creating CVAT task '%s' with %d resources", task_name, len(local_files))
-    with make_client(CVAT_URL, access_token=ACCESS_TOKEN) as client:
+    from video_utils import is_video_file
+
+    is_video = len(local_files) == 1 and is_video_file(local_files[0])
+    logger.info(
+        "Creating CVAT task '%s' with %d resources (video=%s)",
+        task_name,
+        len(local_files),
+        is_video,
+    )
+    with _make_cvat_client() as client:
         # 1) create task
         task = client.tasks.create(spec={"name": task_name, "labels": labels or [{"name": "object"}]})
 
         # 2) upload files (SDK streams files to server)
+        upload_kwargs: dict[str, Any] = {
+            "resource_type": ResourceType.LOCAL,
+            "resources": local_files,
+        }
+        if upload_params:
+            upload_kwargs["params"] = upload_params
         try:
-            # SDK accepts list[str] paths for streaming upload
-            task.upload_data(resource_type=ResourceType.LOCAL, resources=local_files)
+            task.upload_data(**upload_kwargs)
         except Exception as e:
             logger.exception("task.upload_data() failed: %s", e)
             raise RuntimeError(f"Failed to upload data via SDK: {e}") from e
 
-        # optionally wait for size
         task_id = getattr(task, "id", None)
         if task_id is None:
             raise RuntimeError("Failed to get task id after create/upload")
-        ok = _wait_for_task_size(client, task_id, expected_count=len(local_files), timeout=timeout)
+
+        if is_video:
+            min_size = max(2, int(video_min_frames or 2))
+            ok = _wait_for_task_ready(client, int(task_id), min_size=min_size, timeout=timeout)
+        else:
+            ok = _wait_for_task_size(client, int(task_id), expected_count=len(local_files), timeout=timeout)
         if not ok:
-            logger.warning("Task %s not ready after %ss (size may be different). Proceeding anyway.", task_id, timeout)
+            logger.warning("Task %s not ready after %ss. Proceeding anyway.", task_id, timeout)
         return int(task_id)
 # вставьте это вместо старой export_annotations_by_id
 from urllib.parse import quote_plus
 
 
 def _auth_headers() -> dict:
-    if USE_BEARER:
-        return {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    else:
-        return {"Authorization": f"Token {ACCESS_TOKEN}"}
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"} if USE_BEARER else {"Authorization": f"Token {ACCESS_TOKEN}"}
+    if CVAT_ORG:
+        # CVAT cloud/org-scoped deployments may return 404 without explicit org context.
+        headers["X-Organization"] = CVAT_ORG
+    return headers
+
+
+def _make_cvat_client():
+    kwargs = {"access_token": ACCESS_TOKEN}
+    if CVAT_ORG:
+        kwargs["organization_slug"] = CVAT_ORG
+    try:
+        return make_client(CVAT_URL, **kwargs)
+    except TypeError:
+        # Backward-compatible SDK signatures without organization_slug.
+        return make_client(CVAT_URL, access_token=ACCESS_TOKEN)
 
 
 def _http_get_paged(session: requests.Session, url: str, params: Optional[dict] = None, timeout: int = 30) -> List[dict]:
@@ -411,7 +531,7 @@ def export_annotations_by_id(task_id: int, out_zip_path: str, format_name: str =
 
     # 1) SDK path (best effort)
     try:
-        with make_client(CVAT_URL, access_token=ACCESS_TOKEN) as client:
+        with _make_cvat_client() as client:
             try:
                 task = client.tasks.retrieve(task_id)
             except ApiException as e:
@@ -440,17 +560,17 @@ def export_annotations_by_id(task_id: int, out_zip_path: str, format_name: str =
 
     # 2) HTTP fallback: try several variants
     url_base = CVAT_URL.rstrip("/")
-    headers = {"Accept": "application/zip"}
-    if USE_BEARER:
-        headers["Authorization"] = f"Bearer {ACCESS_TOKEN}"
-    else:
-        headers["Authorization"] = f"Token {ACCESS_TOKEN}"
+    # Some CVAT deployments reject strict "application/zip" Accept header
+    # with 406. Keep Accept generic and retry once without Accept on 406.
+    headers = {"Accept": "*/*"}
+    headers.update(_auth_headers())
 
     session = _build_requests_session()
     session.headers.update(headers)
 
     # Prepare list of attempts (method, url, params, data)
     encoded = quote_plus(format_name)
+    save_images_variants = [str(bool(include_images)).lower(), "True" if include_images else "False"]
     attempts = [
         ("GET", f"{url_base}/api/tasks/{task_id}/annotations", {"action": "export", "format": format_name}, None),
         ("GET", f"{url_base}/api/tasks/{task_id}/annotations", {"format": format_name}, None),
@@ -459,6 +579,13 @@ def export_annotations_by_id(task_id: int, out_zip_path: str, format_name: str =
         # POST with form-data (some backends prefer POST)
         ("POST", f"{url_base}/api/tasks/{task_id}/annotations", None, {"format": format_name, "action": "export"}),
         ("POST", f"{url_base}/api/tasks/{task_id}/annotations?action=export", None, {"format": format_name}),
+        # newer CVAT builds often export through dataset endpoints
+        ("POST", f"{url_base}/api/tasks/{task_id}/dataset/export", {"format": format_name, "save_images": save_images_variants[0]}, None),
+        ("POST", f"{url_base}/api/tasks/{task_id}/dataset/export", {"format": format_name, "save_images": save_images_variants[1]}, None),
+        ("GET", f"{url_base}/api/tasks/{task_id}/dataset/export", {"format": format_name, "save_images": save_images_variants[0]}, None),
+        ("GET", f"{url_base}/api/tasks/{task_id}/dataset/export", {"format": format_name, "save_images": save_images_variants[1]}, None),
+        ("GET", f"{url_base}/api/tasks/{task_id}/dataset", {"action": "export", "format": format_name}, None),
+        ("GET", f"{url_base}/api/tasks/{task_id}/dataset", {"format": format_name}, None),
     ]
 
     last_err = None
@@ -473,6 +600,34 @@ def export_annotations_by_id(task_id: int, out_zip_path: str, format_name: str =
             logger.debug("Request exception for %s %s: %s", method, url, e)
             last_err = e
             continue
+
+        # Compatibility fallback for strict Accept negotiation on some servers.
+        if resp.status_code == 406:
+            try:
+                hdrs = dict(session.headers)
+                hdrs.pop("Accept", None)
+                logger.info("HTTP export got 406; retrying once without Accept header")
+                if method == "GET":
+                    resp = session.get(
+                        url,
+                        params=params,
+                        timeout=60,
+                        stream=True,
+                        verify=(not CVAT_INSECURE),
+                        headers=hdrs,
+                    )
+                else:
+                    resp = session.post(
+                        url,
+                        params=params,
+                        data=data,
+                        timeout=60,
+                        stream=True,
+                        verify=(not CVAT_INSECURE),
+                        headers=hdrs,
+                    )
+            except Exception as e:
+                logger.debug("Retry without Accept failed for %s %s: %s", method, url, e)
 
         body_snippet = None
         try:
@@ -513,7 +668,7 @@ def export_annotations_by_id(task_id: int, out_zip_path: str, format_name: str =
                 # common keys: id, request_id, rq_id
                 for k in ("id", "request_id", "rq_id"):
                     if k in body:
-                        rq_id = int(body[k])
+                        rq_id = str(body[k]).strip()
                         break
             except Exception:
                 body = None
@@ -524,8 +679,9 @@ def export_annotations_by_id(task_id: int, out_zip_path: str, format_name: str =
                 if loc:
                     # sometimes Location ends with /api/requests/{id}
                     try:
-                        candidate = loc.rstrip("/").split("/")[-1]
-                        rq_id = int(candidate)
+                        candidate = loc.rstrip("/").split("/")[-1].strip()
+                        if candidate:
+                            rq_id = candidate
                     except Exception:
                         rq_id = None
 
@@ -543,27 +699,40 @@ def export_annotations_by_id(task_id: int, out_zip_path: str, format_name: str =
                             except Exception:
                                 jb = {}
                             status = jb.get("status") or jb.get("state") or jb.get("result")
+                            if isinstance(status, str):
+                                status = status.lower()
                             logger.debug("Request %s status: %s", rq_id, status)
                             if status in ("completed", "success", "finished", "ok"):
-                                # try to download: /api/requests/{id}/download
-                                dl_url = f"{url_base}/api/requests/{rq_id}/download"
-                                logger.info("Attempting to download async result from %s", dl_url)
-                                rdl = session.get(dl_url, timeout=60, stream=True, verify=(not CVAT_INSECURE))
-                                if rdl.status_code in (200, 201):
-                                    with open(out_path, "wb") as fh:
-                                        for chunk in rdl.iter_content(chunk_size=8192):
-                                            if chunk:
-                                                fh.write(chunk)
-                                    if out_path.exists() and out_path.stat().st_size > 0:
-                                        logger.info("Saved async export result to %s", out_path)
-                                        return str(out_path)
-                                else:
-                                    logger.warning("Async download returned status %s", rdl.status_code)
-                                    # maybe response contains direct link in body
-                                    try:
-                                        logger.debug("async download body: %s", rdl.text[:1000])
-                                    except Exception:
-                                        pass
+                                # Depending on CVAT version, completed request may expose direct result URL.
+                                candidate_urls = []
+                                for k in ("result_url", "url", "download_url"):
+                                    v = jb.get(k)
+                                    if isinstance(v, str) and v.strip():
+                                        if v.startswith("http://") or v.startswith("https://"):
+                                            candidate_urls.append(v)
+                                        elif v.startswith("/"):
+                                            candidate_urls.append(f"{url_base}{v}")
+                                candidate_urls.append(f"{url_base}/api/requests/{rq_id}/download")
+                                candidate_urls.append(
+                                    f"{url_base}/api/tasks/{task_id}/dataset/export?format={quote_plus(format_name)}&save_images={save_images_variants[0]}"
+                                )
+                                for dl_url in candidate_urls:
+                                    logger.info("Attempting to download async result from %s", dl_url)
+                                    rdl = session.get(dl_url, timeout=60, stream=True, verify=(not CVAT_INSECURE))
+                                    if rdl.status_code in (200, 201):
+                                        with open(out_path, "wb") as fh:
+                                            for chunk in rdl.iter_content(chunk_size=8192):
+                                                if chunk:
+                                                    fh.write(chunk)
+                                        if out_path.exists() and out_path.stat().st_size > 0:
+                                            logger.info("Saved async export result to %s", out_path)
+                                            return str(out_path)
+                                    else:
+                                        logger.warning("Async download returned status %s for %s", rdl.status_code, dl_url)
+                                        try:
+                                            logger.debug("async download body: %s", rdl.text[:1000])
+                                        except Exception:
+                                            pass
                                 # if failed - break and continue attempts
                                 break
                             if status in ("failed", "error"):
@@ -582,6 +751,12 @@ def export_annotations_by_id(task_id: int, out_zip_path: str, format_name: str =
 
     # if reached here - no successful attempts
     logger.error("All HTTP export attempts failed; last error: %s", last_err)
+    last_err_text = str(last_err or "")
+    if "No Task matches the given query" in last_err_text:
+        raise RuntimeError(
+            "HTTP export attempts failed: task not found in current CVAT context. "
+            "Check CVAT_URL/CVAT_TOKEN and set CVAT_ORG if task belongs to an organization."
+        ) from last_err
     raise RuntimeError(f"HTTP export attempts failed, last checked file: {out_path}") from last_err
 def _build_requests_session(retries: int = 3, backoff_factor: float = 0.5, status_forcelist=(500, 502, 503, 504)) -> requests.Session:
     session = requests.Session()
@@ -600,7 +775,7 @@ def _build_requests_session(retries: int = 3, backoff_factor: float = 0.5, statu
     return session
 
 
-def _http_post_import_annotations(task_id: int, annotations_path: str, format_name: str, timeout: int = 600) -> Optional[Union[int, None]]:
+def _http_post_import_annotations(task_id: int, annotations_path: str, format_name: str, timeout: int = 600) -> Optional[Union[int, str, None]]:
     if not format_name or not str(format_name).strip():
         raise ValueError("format_name must be provided (e.g. 'COCO 1.0')")
 
@@ -612,11 +787,7 @@ def _http_post_import_annotations(task_id: int, annotations_path: str, format_na
         (f"{url_base}/api/tasks/{task_id}/dataset", None),
     ]
 
-    headers = {}
-    if USE_BEARER:
-        headers["Authorization"] = f"Bearer {ACCESS_TOKEN}"
-    else:
-        headers["Authorization"] = f"Token {ACCESS_TOKEN}"
+    headers = _auth_headers()
 
     files_field_candidates = ["annotation_file", "file", "data", "annotations"]
     verify_ssl = not CVAT_INSECURE
@@ -657,15 +828,20 @@ def _http_post_import_annotations(task_id: int, annotations_path: str, format_na
                     except Exception:
                         body = None
 
-                    rq_id = None
+                    rq_id: Optional[Union[int, str]] = None
                     if isinstance(body, dict):
                         for key in ("id", "rq_id", "request_id", "requestId", "result"):
-                            if key in body and isinstance(body[key], (int, str)):
-                                try:
-                                    rq_id = int(body[key])
+                            if key in body and body[key] is not None:
+                                raw = body[key]
+                                if isinstance(raw, int):
+                                    rq_id = raw
                                     break
-                                except Exception:
-                                    pass
+                                if isinstance(raw, str) and raw.strip():
+                                    if raw.strip().isdigit():
+                                        rq_id = int(raw.strip())
+                                    else:
+                                        rq_id = raw.strip()
+                                    break
 
                     if rq_id is None:
                         loc = resp.headers.get("Location") or resp.headers.get("location")
@@ -694,17 +870,26 @@ def _http_post_import_annotations(task_id: int, annotations_path: str, format_na
 
     logger.error("All HTTP upload attempts failed; samples: %s", last_resp_info[-5:])
     raise RuntimeError(f"HTTP import attempts failed: could not upload annotations via direct API (no usable response). Last attempts: {last_resp_info[-5:]}")
-def _poll_request_status_http(rq_id: int, timeout: int = 600, poll_interval: float = 2.0) -> str:
-    url = f"{CVAT_URL.rstrip('/')}/api/requests/{rq_id}"
-    headers = {}
-    if USE_BEARER:
-        headers["Authorization"] = f"Bearer {ACCESS_TOKEN}"
+def _poll_request_status_http(rq_id: Union[int, str], timeout: int = 600, poll_interval: float = 2.0) -> str:
+    headers = _auth_headers()
+    if isinstance(rq_id, str) and "=" in rq_id and not rq_id.isdigit():
+        logger.warning(
+            "CVAT composite rq_id not pollable (%s); treating import as accepted",
+            str(rq_id)[:120],
+        )
+        return "poll_skipped"
+
+    if isinstance(rq_id, str) and rq_id.isdigit():
+        url = f"{CVAT_URL.rstrip('/')}/api/requests/{int(rq_id)}"
     else:
-        headers["Authorization"] = f"Token {ACCESS_TOKEN}"
+        url = f"{CVAT_URL.rstrip('/')}/api/requests/{rq_id}"
 
     start = time.time()
     while True:
         resp = requests.get(url, headers=headers, timeout=30, verify=(not CVAT_INSECURE))
+        if resp.status_code == 404:
+            logger.warning("CVAT import poll 404 for rq_id=%s; import may still have succeeded", rq_id)
+            return "poll_unavailable"
         if resp.status_code == 200:
             try:
                 body = resp.json()
@@ -725,7 +910,7 @@ def _poll_request_status_http(rq_id: int, timeout: int = 600, poll_interval: flo
             raise TimeoutError(f"Import request {rq_id} not finished after {timeout}s")
         time.sleep(poll_interval)
 
-def import_annotations_to_task(task_id: int, annotations_path: str, format_name: str = "COCO 1.0", timeout: int = 600) -> Optional[int]:
+def import_annotations_to_task(task_id: int, annotations_path: str, format_name: str = "COCO 1.0", timeout: int = 600) -> Optional[Union[int, str]]:
     """
     Try SDK import first, then fallback to HTTP endpoints.
     Returns request id if asynchronous import started; None if synchronous import or immediate success.
@@ -738,7 +923,7 @@ def import_annotations_to_task(task_id: int, annotations_path: str, format_name:
 
     # First: SDK path (best-effort, handles async vs sync for many CVAT versions)
     try:
-        with make_client(CVAT_URL, access_token=ACCESS_TOKEN) as client:
+        with _make_cvat_client() as client:
             try:
                 # try modern signature first
                 resp = client.tasks.create_annotations(id=task_id, filename=Path(annotations_path).name, format=format_name, annotation_file_request=open(annotations_path, "rb"))
@@ -799,7 +984,7 @@ def import_annotations_to_task(task_id: int, annotations_path: str, format_name:
     # HTTP fallback
     try:
         rq = _http_post_import_annotations(task_id, annotations_path, format_name, timeout=timeout)
-        if isinstance(rq, int):
+        if rq is not None:
             try:
                 _poll_request_status_http(rq, timeout=timeout)
                 return rq

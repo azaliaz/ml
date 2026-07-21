@@ -19,6 +19,7 @@ from .models import (
     MODEL_STORE,
     MAX_MASKS_PER_IMAGE,
     logger,
+    siglip_classifier_available,
 )
 
 # Ensure logger configured (user can set PREANN_DEBUG=1 to enable DEBUG)
@@ -104,6 +105,74 @@ def _postprocess_mask(mask: np.ndarray, bbox: List[int], *, is_rope_like: bool) 
         final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     return (final_mask > 0).astype(np.uint8)
+
+
+def _bbox_iou(a: List[int], b: List[int]) -> float:
+    ax0, ay0, ax1, ay1 = [int(v) for v in a]
+    bx0, by0, bx1, by1 = [int(v) for v in b]
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+    inter = float(iw * ih)
+    if inter <= 0.0:
+        return 0.0
+    area_a = float(max(0, ax1 - ax0) * max(0, ay1 - ay0))
+    area_b = float(max(0, bx1 - bx0) * max(0, by1 - by0))
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
+def _dedupe_overlapping_boxes(
+    boxes: List[Dict[str, Any]],
+    *,
+    iou_thr: float = 0.5,
+) -> List[Dict[str, Any]]:
+    """Drop duplicate detections; keep nested small PPE boxes inside large person boxes."""
+    if not boxes:
+        return []
+
+    def _area(b: List[int]) -> float:
+        x0, y0, x1, y1 = [int(v) for v in b]
+        return float(max(0, x1 - x0) * max(0, y1 - y0))
+
+    ordered = sorted(boxes, key=lambda x: -float(x.get("score", 0.0)))
+    kept: List[Dict[str, Any]] = []
+    for cand in ordered:
+        cand_bbox = cand["bbox"]
+        cand_area = _area(cand_bbox)
+        drop = False
+        for prev in kept:
+            iou = _bbox_iou(cand_bbox, prev["bbox"])
+            if iou < iou_thr:
+                continue
+            prev_area = _area(prev["bbox"])
+            # Small object inside a larger one — keep both (e.g. helmet on person).
+            if cand_area < prev_area * 0.40 or prev_area < cand_area * 0.40:
+                continue
+            drop = True
+            break
+        if not drop:
+            kept.append(cand)
+    return kept
+
+
+def _padded_crop(img: Image.Image, box: List[int], *, pad_ratio: float = 0.12) -> Image.Image:
+    w, h = img.size
+    x0, y0, x1, y1 = _clip_bbox_to_shape(box, h, w)
+    if x1 <= x0 or y1 <= y0:
+        return img.crop((x0, y0, max(x0 + 1, x1), max(y0 + 1, y1)))
+    bw, bh = x1 - x0, y1 - y0
+    px, py = int(bw * pad_ratio), int(bh * pad_ratio)
+    cx0, cy0 = max(0, x0 - px), max(0, y0 - py)
+    cx1, cy1 = min(w, x1 + px), min(h, y1 + py)
+    return img.crop((cx0, cy0, cx1, cy1))
+
+
+def _siglip_class_prompts(class_names: List[str]) -> List[str]:
+    """Generic SigLIP prompts from class names (open vocabulary)."""
+    return [f"a photo of a {name}" for name in class_names]
 
 
 def _dedupe_overlapping_masks(
@@ -232,54 +301,668 @@ def run_inference_grounding_dino(
         return run_inference_grounding_dino_stub(image_path, text_prompt, score_threshold, max_boxes)
 
 
-def run_inference_clip_classify(image_path: str, labels: List[str]) -> List[Dict[str, Any]]:
-    if MODEL_STORE.get("clip_model") is None or MODEL_STORE.get("clip_preprocess") is None:
-        logger.debug("CLIP model or preprocess missing, returning zero scores.")
+def run_inference_siglip_classify(
+    image_path: str,
+    labels: List[str],
+    *,
+    text_prompts: List[str] | None = None,
+) -> List[Dict[str, Any]]:
+    clf = MODEL_STORE.get("siglip_classifier")
+    if clf is None:
+        logger.debug("SigLIP2 classifier not loaded, returning zero scores.")
         return [{"label": l, "score": 0.0} for l in labels]
+
+    if not labels:
+        return []
+
+    prompts = text_prompts if text_prompts is not None else labels
+    if len(prompts) != len(labels):
+        prompts = labels
 
     try:
         import torch
 
-        model = MODEL_STORE["clip_model"]
-        preprocess = MODEL_STORE["clip_preprocess"]
-        device = MODEL_STORE["clip_device"] or ("cuda" if torch.cuda.is_available() else "cpu")
-
         image = Image.open(image_path).convert("RGB")
-        image_input = preprocess(image).unsqueeze(0).to(device)
+        model = clf.model
+        tokenizer = clf.tokenizer
+        image_processor = getattr(clf, "image_processor", None) or getattr(
+            clf, "feature_extractor", None
+        )
+        if image_processor is None:
+            raise RuntimeError("SigLIP2 pipeline has no image processor")
 
-        from .models import CLIP_BACKEND  # local import to avoid cycle
+        device = model.device
+        text_inputs = tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+        image_inputs = image_processor(images=image, return_tensors="pt")
+        inputs = {**text_inputs, **image_inputs}
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        if CLIP_BACKEND == "open_clip":
-            import open_clip  # type: ignore
+        with torch.inference_mode():
+            outputs = model(**inputs)
 
-            text_tokens = open_clip.tokenize(labels).to(device)
-            with torch.no_grad():
-                image_features = model.encode_image(image_input)
-                text_features = model.encode_text(text_tokens)
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-                logits = (100.0 * image_features @ text_features.T).squeeze(0)
-                probs = logits.softmax(dim=0).cpu().numpy().tolist()
-        else:
-            import clip  # type: ignore
+        logits = outputs.logits_per_image
+        if logits.dim() == 2:
+            logits = logits[0]
+        probs = torch.softmax(logits, dim=-1)
 
-            text_tokens = clip.tokenize(labels).to(device)
-            with torch.no_grad():
-                image_features = model.encode_image(image_input)
-                text_features = model.encode_text(text_tokens)
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-                logits = (100.0 * image_features @ text_features.T).squeeze(0)
-                probs = logits.softmax(dim=0).cpu().numpy().tolist()
-
-        logger.debug("CLIP classify for labels %s -> probs %s", labels, probs)
-        results = [{"label": label, "score": float(prob)} for label, prob in zip(labels, probs)]
+        results = [
+            {"label": str(labels[i]), "score": float(probs[i])}
+            for i in range(len(labels))
+        ]
         results = sorted(results, key=lambda x: -x["score"])
-        logger.info("CLIP classification top: %s", results[0] if results else None)
+        logger.info("SigLIP2 classification top: %s", results[0] if results else None)
         return results
     except Exception as e:
-        logger.exception("CLIP classify failed: %s", e)
+        logger.exception("SigLIP2 classify failed: %s", e)
         return [{"label": l, "score": 0.0} for l in labels]
+
+
+def run_inference_clip_classify(image_path: str, labels: List[str]) -> List[Dict[str, Any]]:
+    """Backward-compatible alias for SigLIP2 zero-shot classification."""
+    return run_inference_siglip_classify(image_path, labels)
+
+
+def _norm_class_name(value: str) -> str:
+    return " ".join(str(value).strip().lower().replace("_", " ").split())
+
+
+# Size categories (generic — not tied to specific CVAT labels).
+# Override per class via API payload: class_size_hints={"helmet": "tiny", "bus": "large"}
+_SIZE_CATEGORY_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "tiny": {
+        "threshold_boost": -0.03,
+        "min_area_ratio": 0.00015,
+        "max_area_ratio": 0.10,
+        "max_boxes_per_class": 10,
+        "reserve_in_final": 4,
+        "search_on_person": True,
+        "per_person_max": 3,
+    },
+    "small": {
+        "threshold_boost": -0.02,
+        "min_area_ratio": 0.0003,
+        "max_area_ratio": 0.20,
+        "max_boxes_per_class": 6,
+        "reserve_in_final": 2,
+        "search_on_person": True,
+        "per_person_max": 2,
+    },
+    "medium": {
+        "threshold_boost": 0.03,
+        "min_area_ratio": 0.003,
+        "max_area_ratio": 0.50,
+        "max_boxes_per_class": 5,
+        "reserve_in_final": 2,
+        "search_on_person": False,
+        "per_person_max": 1,
+    },
+    "large": {
+        "threshold_boost": -0.02,
+        "min_area_ratio": 0.035,
+        "max_area_ratio": 0.98,
+        "max_boxes_per_class": 3,
+        "reserve_in_final": 1,
+        "search_on_person": False,
+        "per_person_max": 1,
+        "requires_height": True,
+    },
+}
+
+_VALID_SIZE_CATEGORIES = frozenset(_SIZE_CATEGORY_DEFAULTS.keys())
+
+
+def _infer_size_category(class_name: str) -> str:
+    """Weak default when user did not pass class_size_hints."""
+    n = _norm_class_name(class_name)
+    if any(k in n for k in ("person", "people", "worker", "human", "pedestrian", "man", "woman")):
+        return "medium"
+    if any(k in n for k in ("crane", "tower", "building", "vehicle", "truck", "bus", "excavator")):
+        return "large"
+    if any(k in n for k in ("helmet", "glove", "hat", "mask", "glasses", "boot", "vest")):
+        return "tiny"
+    return "small"
+
+
+def _build_class_settings(
+    class_names: List[str],
+    class_size_hints: Dict[str, str] | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    hints = {_norm_class_name(k): str(v).strip().lower() for k, v in (class_size_hints or {}).items()}
+    settings: Dict[str, Dict[str, Any]] = {}
+    for class_name in class_names:
+        norm = _norm_class_name(class_name)
+        category = hints.get(norm) or _infer_size_category(class_name)
+        if category not in _VALID_SIZE_CATEGORIES:
+            category = "small"
+        settings[norm] = {
+            "class_name": class_name,
+            "size_category": category,
+            **_SIZE_CATEGORY_DEFAULTS[category],
+        }
+    return settings
+
+
+def _class_cfg(class_name: str, class_settings: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    cfg = class_settings.get(_norm_class_name(class_name))
+    if cfg:
+        return cfg
+    return {"class_name": class_name, "size_category": "small", **_SIZE_CATEGORY_DEFAULTS["small"]}
+
+
+def _bbox_area_ratio(bbox: List[int], img_w: int, img_h: int) -> float:
+    x0, y0, x1, y1 = [int(v) for v in bbox]
+    box_area = float(max(0, x1 - x0) * max(0, y1 - y0))
+    return box_area / float(max(1, img_w * img_h))
+
+
+def _gnd_prompt(class_name: str) -> str:
+    name = str(class_name).strip()
+    if not name:
+        return "object ."
+    if " . " in name or name.endswith(" ."):
+        return name
+    return f"{name} ."
+
+
+def _gnd_settings_for_class(
+    class_name: str,
+    base_threshold: float,
+    class_settings: Dict[str, Dict[str, Any]],
+) -> tuple[str, float, float, float]:
+    cfg = _class_cfg(class_name, class_settings)
+    prompt = _gnd_prompt(str(cfg.get("class_name", class_name)))
+    threshold = max(0.22, min(0.65, base_threshold + float(cfg.get("threshold_boost", 0.0))))
+    min_area = float(cfg.get("min_area_ratio", 0.0002))
+    max_area = float(cfg.get("max_area_ratio", 0.90))
+    return prompt, threshold, min_area, max_area
+
+
+def _passes_bbox_size_filter(
+    class_name: str,
+    area_ratio: float,
+    class_settings: Dict[str, Dict[str, Any]],
+    bbox: List[int] | None = None,
+    img_w: int = 0,
+    img_h: int = 0,
+) -> bool:
+    cfg = _class_cfg(class_name, class_settings)
+    min_area = float(cfg.get("min_area_ratio", 0.0002))
+    max_area = float(cfg.get("max_area_ratio", 0.90))
+    if area_ratio < min_area or area_ratio > max_area:
+        return False
+
+    if not cfg.get("requires_height") or not bbox or img_w <= 0 or img_h <= 0:
+        return True
+
+    x0, y0, x1, y1 = [int(v) for v in bbox]
+    bw = max(1, x1 - x0)
+    bh = max(1, y1 - y0)
+    height_ratio = bh / float(img_h)
+    if area_ratio < 0.045:
+        return False
+    if height_ratio >= 0.14 and area_ratio >= 0.03:
+        return True
+    if area_ratio >= 0.06:
+        return True
+    if bw > bh * 2.5 and area_ratio < 0.12:
+        return False
+    return height_ratio >= 0.10 and area_ratio >= 0.035
+
+
+def _person_crop_region(
+    person_bbox: List[int],
+    img_w: int,
+    img_h: int,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = _clip_bbox_to_shape(person_bbox, img_h, img_w)
+    ph = max(1, y1 - y0)
+    pw = max(1, x1 - x0)
+    pad_x = int(pw * 0.08)
+    pad_y = int(ph * 0.05)
+    return (
+        max(0, x0 - pad_x),
+        max(0, y0 - pad_y),
+        min(img_w, x1 + pad_x),
+        min(img_h, y1 + pad_y),
+    )
+
+
+def _gnd_detect_on_crop(
+    img: Image.Image,
+    crop_xyxy: tuple[int, int, int, int],
+    pred_class: str,
+    score_threshold: float,
+    max_boxes: int,
+    class_settings: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Run GND on a crop and map boxes back to full-image coordinates."""
+    import os
+    import tempfile
+
+    img_w, img_h = img.size
+    x0, y0, x1, y1 = crop_xyxy
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return []
+
+    crop = img.crop((x0, y0, x1, y1))
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmpf:
+            tmp_path = tmpf.name
+        crop.save(tmp_path)
+        prompt, class_thr, _, _ = _gnd_settings_for_class(
+            pred_class, score_threshold, class_settings
+        )
+        class_thr = max(0.20, class_thr - 0.05)
+        raw = run_inference_grounding_dino(
+            tmp_path, prompt, score_threshold=class_thr, max_boxes=max_boxes
+        )
+        results: List[Dict[str, Any]] = []
+        for b in raw:
+            bx0, by0, bx1, by1 = [int(v) for v in b["bbox"]]
+            full = [bx0 + x0, by0 + y0, bx1 + x0, by1 + y0]
+            full = list(_clip_bbox_to_shape(full, img_h, img_w))
+            area_ratio = _bbox_area_ratio(full, img_w, img_h)
+            if not _passes_bbox_size_filter(
+                pred_class, area_ratio, class_settings, full, img_w, img_h
+            ):
+                continue
+            results.append(
+                {
+                    "bbox": full,
+                    "score": float(b.get("score", 0.0)),
+                    "label": str(b.get("label", "")),
+                    "pred_class": pred_class,
+                    "gnd_phrase": str(b.get("label", "")),
+                    "area_ratio": area_ratio,
+                    "source": "person_crop",
+                }
+            )
+        return results
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+def _detect_nested_on_persons(
+    img: Image.Image,
+    person_boxes: List[Dict[str, Any]],
+    class_names: List[str],
+    score_threshold: float,
+    class_settings: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Second pass: search tiny/small classes inside each medium (person) bbox."""
+    nested_classes = [
+        c for c in class_names if _class_cfg(c, class_settings).get("search_on_person")
+    ]
+    if not nested_classes or not person_boxes:
+        return []
+
+    img_w, img_h = img.size
+    extra: List[Dict[str, Any]] = []
+    for person in person_boxes:
+        region = _person_crop_region(person["bbox"], img_w, img_h)
+        for nested_class in nested_classes:
+            per_person_max = int(_class_cfg(nested_class, class_settings).get("per_person_max", 2))
+            found = _gnd_detect_on_crop(
+                img,
+                region,
+                nested_class,
+                score_threshold,
+                per_person_max,
+                class_settings,
+            )
+            extra.extend(found)
+    logger.info(
+        "Person-crop nested pass: +%d boxes (persons=%d classes=%s)",
+        len(extra),
+        len(person_boxes),
+        [_norm_class_name(c) for c in nested_classes],
+    )
+    return extra
+
+
+def _max_boxes_for_class(
+    class_name: str,
+    max_boxes: int,
+    n_classes: int,
+    class_settings: Dict[str, Dict[str, Any]],
+) -> int:
+    cfg = _class_cfg(class_name, class_settings)
+    per_class = int(cfg.get("max_boxes_per_class", max(3, max_boxes // max(1, n_classes))))
+    return max(per_class, max_boxes // max(1, n_classes))
+
+
+def _select_final_classification_boxes(
+    boxes: List[Dict[str, Any]],
+    max_boxes: int,
+    class_names: List[str],
+    class_settings: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep top boxes; reserve slots per size category (many tiny, few large)."""
+    if not boxes:
+        return []
+
+    def _norm_pred(b: Dict[str, Any]) -> str:
+        return _norm_class_name(str(b.get("pred_class", "")))
+
+    ordered = sorted(boxes, key=lambda x: -float(x.get("score", 0.0)))
+    kept: List[Dict[str, Any]] = []
+    kept_ids: set[int] = set()
+
+    def _add(box: Dict[str, Any]) -> None:
+        bid = id(box)
+        if bid in kept_ids:
+            return
+        kept.append(box)
+        kept_ids.add(bid)
+
+    for class_name in class_names:
+        norm = _norm_class_name(class_name)
+        target = int(_class_cfg(class_name, class_settings).get("reserve_in_final", 1))
+        class_boxes = [b for b in ordered if _norm_pred(b) == norm]
+        for b in class_boxes[:target]:
+            _add(b)
+
+    for b in ordered:
+        if len(kept) >= max_boxes:
+            break
+        _add(b)
+
+    if len(kept) > max_boxes:
+        kept = sorted(kept, key=lambda x: -float(x.get("score", 0.0)))[:max_boxes]
+    return kept
+
+
+def _siglip_candidates_for_area(
+    class_names: List[str],
+    area_ratio: float,
+    class_settings: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    """On small crops only compare tiny/small classes (avoid large-structure confusion)."""
+    if area_ratio >= 0.10:
+        return list(class_names)
+    return [
+        c
+        for c in class_names
+        if _class_cfg(c, class_settings).get("size_category") in ("tiny", "small")
+    ] or list(class_names)
+
+
+def match_label_to_class(label: str, class_names: List[str]) -> str:
+    if not class_names:
+        return "object"
+    if not label:
+        return class_names[0]
+    label_n = _norm_class_name(label)
+    by_norm = {_norm_class_name(c): c for c in class_names}
+    if label_n in by_norm:
+        return by_norm[label_n]
+    for c in class_names:
+        cn = _norm_class_name(c)
+        if cn and (cn in label_n or label_n in cn):
+            return c
+    return class_names[0]
+
+
+def build_gnd_caption(class_names: List[str]) -> str:
+    parts = [str(c).strip() for c in class_names if str(c).strip()]
+    if not parts:
+        return "object ."
+    return " . ".join(parts) + " ."
+
+
+def _siglip_best_label(image_path: str, class_names: List[str]) -> tuple[str, float] | None:
+    prompts = _siglip_class_prompts(class_names)
+    ranked = run_inference_siglip_classify(
+        image_path, class_names, text_prompts=prompts
+    )
+    if not ranked:
+        return None
+    best = max(ranked, key=lambda x: float(x.get("score", 0.0)))
+    score = float(best.get("score", 0.0))
+    if score <= 0.0:
+        return None
+    return str(best.get("label", class_names[0])), score
+
+
+def _refine_class_with_siglip(
+    crop_path: str,
+    gnd_class: str,
+    class_names: List[str],
+    class_settings: Dict[str, Dict[str, Any]],
+    *,
+    area_ratio: float,
+) -> tuple[str, float, str]:
+    """
+    Verify GND class with SigLIP among size-appropriate candidates only.
+    """
+    candidates = _siglip_candidates_for_area(class_names, area_ratio, class_settings)
+    gnd_norm = _norm_class_name(gnd_class)
+    if gnd_norm not in {_norm_class_name(c) for c in candidates}:
+        candidates = [gnd_class] + [c for c in candidates if _norm_class_name(c) != gnd_norm]
+
+    prompts = _siglip_class_prompts(candidates)
+    ranked = run_inference_siglip_classify(
+        crop_path, candidates, text_prompts=prompts
+    )
+    if not ranked:
+        return gnd_class, 0.0, ""
+
+    best = ranked[0]
+    second_score = float(ranked[1]["score"]) if len(ranked) > 1 else 0.0
+    best_score = float(best.get("score", 0.0))
+    margin = best_score - second_score
+    siglip_class = match_label_to_class(str(best.get("label", "")), candidates)
+
+    if siglip_class not in candidates:
+        return gnd_class, best_score, siglip_class
+
+    if best_score < 0.24:
+        return gnd_class, best_score, siglip_class
+
+    if siglip_class == gnd_class:
+        return gnd_class, best_score, siglip_class
+
+    # Override only with high confidence within the same size bucket.
+    if best_score >= 0.32 and margin >= 0.08:
+        logger.debug(
+            "SigLIP overrides GND %s -> %s (score=%.3f margin=%.3f area=%.3f)",
+            gnd_class,
+            siglip_class,
+            best_score,
+            margin,
+            area_ratio,
+        )
+        return siglip_class, best_score, siglip_class
+
+    return gnd_class, best_score, siglip_class
+
+
+def run_image_classification(
+    image_path: str,
+    class_names: List[str],
+    *,
+    use_siglip: bool = True,
+) -> List[Dict[str, Any]]:
+    """Whole-image classification: one label per image (full-frame bbox)."""
+    img = Image.open(image_path).convert("RGB")
+    w, h = img.size
+    if not class_names:
+        class_names = ["object"]
+
+    if use_siglip and siglip_classifier_available():
+        siglip_result = _siglip_best_label(image_path, class_names)
+        if siglip_result is not None:
+            label, score = siglip_result
+        else:
+            label, score = class_names[0], 0.0
+    else:
+        label, score = class_names[0], 0.0
+
+    return [
+        {
+            "bbox": [0, 0, w, h],
+            "label": match_label_to_class(label, class_names),
+            "score": score,
+            "meta": {"mode": "image", "siglip": use_siglip},
+        }
+    ]
+
+
+def run_object_classification(
+    image_path: str,
+    class_names: List[str],
+    score_threshold: float = 0.3,
+    max_boxes: int = 10,
+    *,
+    use_siglip: bool = True,
+    class_size_hints: Dict[str, str] | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    Object classification: GND per class → NMS → optional SigLIP2 refine on crops.
+    Class list comes from CVAT/user; optional class_size_hints override size category.
+    """
+    import os
+    import tempfile
+
+    if not class_names:
+        class_names = ["object"]
+
+    class_settings = _build_class_settings(class_names, class_size_hints)
+    img = Image.open(image_path).convert("RGB")
+    img_w, img_h = img.size
+    n_classes = max(1, len(class_names))
+
+    boxes_all: List[Dict[str, Any]] = []
+    for cname in class_names:
+        prompt, class_thr, _, _ = _gnd_settings_for_class(
+            cname, score_threshold, class_settings
+        )
+        class_max = _max_boxes_for_class(cname, max_boxes, n_classes, class_settings)
+        try:
+            boxes = run_inference_grounding_dino(
+                image_path,
+                prompt,
+                score_threshold=class_thr,
+                max_boxes=class_max,
+            )
+        except Exception as exc:
+            logger.exception("GroundingDINO failed for class %s: %s", cname, exc)
+            boxes = []
+        for b in boxes:
+            bbox = [int(v) for v in b["bbox"]]
+            area_ratio = _bbox_area_ratio(bbox, img_w, img_h)
+            if not _passes_bbox_size_filter(
+                cname, area_ratio, class_settings, bbox, img_w, img_h
+            ):
+                logger.debug(
+                    "Skip GND box for %s: area_ratio=%.4f phrase=%r bbox=%s",
+                    cname,
+                    area_ratio,
+                    b.get("label"),
+                    bbox,
+                )
+                continue
+            entry = dict(b)
+            entry["bbox"] = bbox
+            entry["pred_class"] = cname
+            entry["gnd_phrase"] = str(b.get("label", ""))
+            entry["area_ratio"] = area_ratio
+            boxes_all.append(entry)
+
+    if not boxes_all:
+        logger.info("Object classification: GND found 0 boxes for %s", Path(image_path).name)
+        return []
+
+    person_boxes = [
+        b
+        for b in boxes_all
+        if _class_cfg(str(b.get("pred_class", "")), class_settings).get("size_category")
+        == "medium"
+    ]
+    if person_boxes and any(
+        _class_cfg(c, class_settings).get("search_on_person") for c in class_names
+    ):
+        boxes_all.extend(
+            _detect_nested_on_persons(
+                img, person_boxes, class_names, score_threshold, class_settings
+            )
+        )
+
+    boxes_all = _dedupe_overlapping_boxes(boxes_all, iou_thr=0.5)
+    has_tiny = any(
+        _class_cfg(c, class_settings).get("size_category") == "tiny" for c in class_names
+    )
+    effective_max = max(max_boxes, 18 if has_tiny else max_boxes)
+    boxes_all = _select_final_classification_boxes(
+        boxes_all, effective_max, class_names, class_settings
+    )
+
+    results: List[Dict[str, Any]] = []
+    for b in boxes_all:
+        x0, y0, x1, y1 = [int(v) for v in b["bbox"]]
+        gnd_phrase = str(b.get("gnd_phrase", ""))
+        pred_class = match_label_to_class(str(b.get("pred_class", "")), class_names)
+        pred_score = float(b.get("score", 0.0))
+        area_ratio = float(b.get("area_ratio", _bbox_area_ratio(b["bbox"], img_w, img_h)))
+        siglip_top = ""
+
+        if use_siglip and siglip_classifier_available():
+            tmp_path: str | None = None
+            try:
+                crop = _padded_crop(img, [x0, y0, x1, y1])
+                if crop.size[0] > 0 and crop.size[1] > 0:
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmpf:
+                        tmp_path = tmpf.name
+                    crop.save(tmp_path)
+                    pred_class, pred_score, siglip_top = _refine_class_with_siglip(
+                        tmp_path,
+                        pred_class,
+                        class_names,
+                        class_settings,
+                        area_ratio=area_ratio,
+                    )
+            except Exception as exc:
+                logger.debug("SigLIP2 crop classify failed: %s", exc)
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+
+        results.append(
+            {
+                "bbox": [x0, y0, x1, y1],
+                "label": pred_class,
+                "score": pred_score,
+                "meta": {
+                    "mode": "object",
+                    "gnd_phrase": gnd_phrase,
+                    "gnd_class": match_label_to_class(str(b.get("pred_class", "")), class_names),
+                    "area_ratio": area_ratio,
+                    "siglip_top": siglip_top,
+                    "siglip": use_siglip,
+                },
+            }
+        )
+
+    logger.info(
+        "Object classification: %d boxes for %s (filtered per-class GND siglip=%s)",
+        len(results),
+        Path(image_path).name,
+        use_siglip,
+    )
+    return results
 
 
 def run_inference_sam_predictor(
@@ -689,7 +1372,7 @@ def run_text_guided_segmentation(
 
     results: List[Dict[str, Any]] = []
 
-    has_clip = MODEL_STORE.get("clip_model") is not None and MODEL_STORE.get("clip_preprocess") is not None
+    has_siglip = siglip_classifier_available()
 
     for prompt in prompts:
         prompt_l = str(prompt).lower()
@@ -745,8 +1428,8 @@ def run_text_guided_segmentation(
             for cand in sam_candidates:
                 mask = cand.get("mask")
                 sam_score = float(cand.get("score", 0.0) or 0.0)
-                clip_score = 0.0
-                if has_clip:
+                siglip_score = 0.0
+                if has_siglip:
                     try:
                         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmpf:
                             tmp_path = tmpf.name
@@ -768,12 +1451,17 @@ def run_text_guided_segmentation(
                             raise RuntimeError("Empty mask crop")
                         crop_masked = (crop * mask_crop[..., None]).astype(np.uint8)
                         Image.fromarray(crop_masked).save(tmp_path)
-                        scores = run_inference_clip_classify(tmp_path, [prompt])
-                        clip_score = float(scores[0]["score"]) if scores else 0.0
-                        logger.debug("CLIP score=%.3f for prompt '%s' bbox=%s", clip_score, prompt, bbox)
+                        scores = run_inference_siglip_classify(tmp_path, [prompt])
+                        siglip_score = float(scores[0]["score"]) if scores else 0.0
+                        logger.debug(
+                            "SigLIP2 score=%.3f for prompt '%s' bbox=%s",
+                            siglip_score,
+                            prompt,
+                            bbox,
+                        )
                     except Exception as e:
-                        logger.debug("CLIP-check failed for candidate: %s", e)
-                        clip_score = 0.0
+                        logger.debug("SigLIP2-check failed for candidate: %s", e)
+                        siglip_score = 0.0
                     finally:
                         try:
                             os.unlink(tmp_path)
@@ -788,11 +1476,11 @@ def run_text_guided_segmentation(
 
                 if is_rope_like:
                     combined = (
-                        0.35 * sam_score + 0.25 * clip_score + 0.3 * edge_score + 0.1 * gnd_score
+                        0.35 * sam_score + 0.25 * siglip_score + 0.3 * edge_score + 0.1 * gnd_score
                     )
                 else:
                     combined = (
-                        0.5 * sam_score + 0.35 * clip_score + 0.15 * edge_score + 0.1 * gnd_score
+                        0.5 * sam_score + 0.35 * siglip_score + 0.15 * edge_score + 0.1 * gnd_score
                     )
                 w_box = bbox[2] - bbox[0]
                 h_box = bbox[3] - bbox[1]
@@ -806,15 +1494,23 @@ def run_text_guided_segmentation(
                     else:
                         combined += 0.15 * edge_score
 
-                logger.debug("Candidate combined score=%.4f (sam=%.3f clip=%.3f edge=%.3f gnd=%.3f) for bbox=%s",
-                             combined, sam_score, clip_score, edge_score, gnd_score, bbox)
+                logger.debug(
+                    "Candidate combined score=%.4f (sam=%.3f siglip=%.3f edge=%.3f gnd=%.3f) for bbox=%s",
+                    combined,
+                    sam_score,
+                    siglip_score,
+                    edge_score,
+                    gnd_score,
+                    bbox,
+                )
 
                 if combined > best_score:
                     best_score = combined
                     best_mask = mask
                     best_meta = {
                         "sam_score": sam_score,
-                        "clip_score": clip_score,
+                        "siglip_score": siglip_score,
+                        "clip_score": siglip_score,
                         "edge_score": edge_score,
                         "gnd_score": gnd_score,
                     }
@@ -822,7 +1518,7 @@ def run_text_guided_segmentation(
             if best_mask is None or (
                 best_meta
                 and best_meta.get("sam_score", 0.0) < 0.2
-                and best_meta.get("clip_score", 0.0) < 0.2
+                and best_meta.get("siglip_score", best_meta.get("clip_score", 0.0)) < 0.2
             ):
                 thin_mask = extract_thin_mask_edges(image_path, bbox)
                 thin_edge_score = compute_edge_alignment_score(image_path, thin_mask)
@@ -833,6 +1529,7 @@ def run_text_guided_segmentation(
                     best_score = max(best_score, 0.2 + 0.5 * thin_edge_score)
                     best_meta = {
                         "sam_score": 0.0,
+                        "siglip_score": 0.0,
                         "clip_score": 0.0,
                         "edge_score": thin_edge_score,
                         "gnd_score": gnd_score,

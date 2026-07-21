@@ -35,8 +35,8 @@ SAM_AUTO_AVAILABLE = False
 GND_DINO_AVAILABLE = False
 GND_DINO_CUDA_OPS = False
 GND_DINO_LAST_ERROR: str = ""
-CLIP_AVAILABLE = False
-CLIP_BACKEND: str | None = None
+SIGLIP_AVAILABLE = False
+SIGLIP_LAST_ERROR: str = ""
 
 SAM_CHECKPOINT = os.environ.get("SAM_CHECKPOINT", "").strip()
 SAM_BACKEND = os.environ.get("SAM_BACKEND", "sam").strip().lower()
@@ -59,6 +59,9 @@ SAM3_TRUST_REMOTE_CODE = os.environ.get("SAM3_TRUST_REMOTE_CODE", "0").strip() i
 )
 GND_DINO_CHECKPOINT = os.environ.get("GND_DINO_CHECKPOINT", "").strip()
 GND_DINO_CONFIG = os.environ.get("GND_DINO_CONFIG", "").strip()
+SIGLIP2_MODEL_ID = os.environ.get(
+    "SIGLIP2_MODEL_ID", "google/siglip2-so400m-patch16-384"
+).strip()
 
 MAX_MASKS_PER_IMAGE = int(os.environ.get("MAX_MASKS_PER_IMAGE", "30"))
 
@@ -69,10 +72,13 @@ MODEL_STORE: Dict[str, Any] = {
     "sam_backend_mode": None,
     "gnd_model": None,
     "gnd_inference_module": None,
-    "clip_model": None,
-    "clip_preprocess": None,
-    "clip_device": None,
+    "siglip_classifier": None,
+    "siglip_device": None,
 }
+
+
+def siglip_classifier_available() -> bool:
+    return MODEL_STORE.get("siglip_classifier") is not None
 
 
 def _masks_scores_boxes_from_sam3_state(state: Dict[str, Any]) -> tuple[Any, Any, Any]:
@@ -1072,66 +1078,46 @@ def load_groundingdino_if_available() -> None:
             GND_DINO_LAST_ERROR = "GroundingDINO model not loaded (unknown reason)"
 
 
-def load_clip_if_available(model_name: str = "ViT-B-32", pretrained: str = "openai") -> None:
-    """Best-effort loader for CLIP / open_clip."""
-    global CLIP_AVAILABLE, CLIP_BACKEND
-
-    try:
-        import open_clip  # type: ignore
-
-        CLIP_BACKEND = "open_clip"
-        CLIP_AVAILABLE = True
-    except Exception:
-        try:
-            import clip  # type: ignore  # noqa: F401
-
-            CLIP_BACKEND = "clip"
-            CLIP_AVAILABLE = True
-        except Exception:
-            CLIP_AVAILABLE = False
-
-    if not CLIP_AVAILABLE:
-        logger.info("CLIP not available in environment.")
-        return
+def load_siglip_if_available() -> None:
+    """Load SigLIP2 zero-shot image classifier (transformers pipeline)."""
+    global SIGLIP_AVAILABLE, SIGLIP_LAST_ERROR
+    SIGLIP_LAST_ERROR = ""
 
     try:
         import torch
-    except Exception:
-        torch = None  # type: ignore[assignment]
+        from transformers import pipeline
+    except ImportError as e:
+        SIGLIP_AVAILABLE = False
+        SIGLIP_LAST_ERROR = f"transformers/torch not available: {e}"
+        logger.info("SigLIP2 not loaded: %s", SIGLIP_LAST_ERROR)
+        return
 
-    if torch is not None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device = "cpu"
-
+    device: int | str = 0 if torch.cuda.is_available() else "cpu"
     try:
-        if CLIP_BACKEND == "open_clip":
-            import open_clip  # type: ignore
-
-            model, _, preprocess = open_clip.create_model_and_transforms(
-                model_name, pretrained=pretrained
-            )
-            model.to(device)
-            model.eval()
-            MODEL_STORE["clip_model"] = model
-            MODEL_STORE["clip_preprocess"] = preprocess
-            MODEL_STORE["clip_device"] = device
-            logger.info("open_clip loaded: %s (%s)", model_name, pretrained)
-        else:
-            import clip  # type: ignore
-
-            model, preprocess = clip.load(model_name, device=device)
-            model.to(device)
-            model.eval()
-            MODEL_STORE["clip_model"] = model
-            MODEL_STORE["clip_preprocess"] = preprocess
-            MODEL_STORE["clip_device"] = device
-            logger.info("openai clip loaded: %s", model_name)
+        clf = pipeline(
+            task="zero-shot-image-classification",
+            model=SIGLIP2_MODEL_ID,
+            device=device,
+        )
+        MODEL_STORE["siglip_classifier"] = clf
+        MODEL_STORE["siglip_device"] = "cuda" if device == 0 else str(device)
+        SIGLIP_AVAILABLE = True
+        logger.info(
+            "SigLIP2 loaded model=%s device=%s",
+            SIGLIP2_MODEL_ID,
+            MODEL_STORE["siglip_device"],
+        )
     except Exception as e:
-        logger.exception("Failed to load CLIP model: %s", e)
-        MODEL_STORE["clip_model"] = None
-        MODEL_STORE["clip_preprocess"] = None
-        MODEL_STORE["clip_device"] = None
+        logger.exception("Failed to load SigLIP2: %s", e)
+        SIGLIP_LAST_ERROR = str(e)
+        MODEL_STORE["siglip_classifier"] = None
+        MODEL_STORE["siglip_device"] = None
+        SIGLIP_AVAILABLE = False
+
+
+def load_clip_if_available(*_args: Any, **_kwargs: Any) -> None:
+    """Backward-compatible alias — loads SigLIP2 instead of CLIP."""
+    load_siglip_if_available()
 
 
 #
@@ -1163,4 +1149,4 @@ if "SAM3_TRUST_REMOTE_CODE" not in globals():
 
 load_sam_model_if_available()
 load_groundingdino_if_available()
-load_clip_if_available()
+load_siglip_if_available()

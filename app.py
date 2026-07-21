@@ -55,7 +55,11 @@ st.sidebar.markdown("---")
 
 score_threshold = st.sidebar.slider("Порог score (для моделей detection, используется ML-сервисом)", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
 max_boxes = st.sidebar.number_input("Max боксов на изображение (для detection)", min_value=1, max_value=200, value=10)
-use_clip = st.sidebar.checkbox("Использовать CLIP для проверки / фильтрации (если доступен)", value=False)
+use_siglip = st.sidebar.checkbox(
+    "Использовать SigLIP2 для проверки / фильтрации crop (если доступен)",
+    value=False,
+)
+use_clip = use_siglip  # backward-compatible payload key
 use_qwen = st.sidebar.checkbox(
     "Использовать Qwen для генерации промптов",
     value=False
@@ -144,11 +148,11 @@ def preannotate_via_service(
             "format": "coco",
             "task_type": task_type,
             "class_names": class_names or [],
+            "classification_mode": "object",
             "use_qwen": bool(use_qwen),
             "qwen_instruction": qwen_instruction or "",
+            "use_clip": bool(use_clip_flag or task_type == "classification"),
         }
-        if use_clip_flag:
-            payload["use_clip"] = True
 
         resp = requests.post(f"{ML_SERVICE_URL}/preannotate", data={"payload": json.dumps(payload)}, files=files, timeout=18000)
         if resp.status_code != 200:
@@ -224,7 +228,7 @@ if st.button("Загрузить в CVAT") and uploaded_files:
                 extra_parts.append(f"score ≥ {score_threshold}")
                 extra_parts.append(f"max_boxes = {int(max_boxes)}")
                 if use_clip:
-                    extra_parts.append("CLIP: да")
+                    extra_parts.append("SigLIP2: да")
                 info_line = f"{task_type_label} · классы: {classes_str} · " + " · ".join(extra_parts)
 
                 st.markdown("**Предразметка**")

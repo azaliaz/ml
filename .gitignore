@@ -1,18 +1,70 @@
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.DS_STORE
+Thumbs.db
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-annotations
-uploads
-images
-.DS_STORE
-.venv
-exports
-weights
-GroundingDINO
-cvat
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+ENV/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Project data & runtime artifacts
+annotations/
+uploads/
+images/
+exports/
+weights/
+data/
+GroundingDINO/
+cvat/
 test_uploader.py
+test_report.txt
+
+# Benchmark caches & generated outputs
+benchmarks/_coco_cache/
+benchmarks/coco_val_subset/
+benchmarks/runs/
+
+# Logs
+*.log
+
+# Frontend (Vite + React)
 frontend/node_modules/
 frontend/.npm-cache/
 frontend/dist/
+frontend/.vite/
+frontend/*.local

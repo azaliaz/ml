@@ -37,17 +37,24 @@ from .models import (
     SAM_BACKEND,
     SAM3_BACKENDS,
     SAM3_MODEL_ID,
-    MODEL_STORE,
     GND_DINO_CHECKPOINT,
     GND_DINO_CONFIG,
     MAX_MASKS_PER_IMAGE,
+    SIGLIP2_MODEL_ID,
+    SIGLIP_AVAILABLE,
+    SIGLIP_LAST_ERROR,
     logger,
+    siglip_classifier_available,
 )
 from .inference import (
     run_inference_grounding_dino,
+    run_inference_siglip_classify,
     run_inference_clip_classify,
     run_inference_sam_auto,
     run_text_guided_segmentation,
+    run_object_classification,
+    run_image_classification,
+    match_label_to_class,
 )
 
 
@@ -346,11 +353,17 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
     class_names = _parse_class_names(data)
     text_prompts = _parse_text_prompts(data)
 
-    score_thr = float(data.get("score_threshold", 0.2))
-    max_boxes = int(data.get("max_boxes", 10))
-    out_format = data.get("format", "coco")
-    use_clip_flag = bool(data.get("use_clip", False))
     task_type = (data.get("task_type") or "").lower().strip()
+    classification_mode = str(data.get("classification_mode", "object") or "object").strip().lower()
+    if classification_mode not in ("object", "image"):
+        classification_mode = "object"
+
+    score_thr = float(
+        data.get("score_threshold", 0.35 if task_type == "classification" else 0.2)
+    )
+    max_boxes = int(data.get("max_boxes", 20 if task_type == "classification" else 10))
+    out_format = data.get("format", "coco")
+    use_clip_flag = bool(data.get("use_clip", False) or data.get("use_siglip", False))
 
     use_qwen = bool(data.get("use_qwen", False) or data.get("use_qwen_flag", False))
     qwen_instruction = str(data.get("qwen_instruction", "") or "").strip()
@@ -390,7 +403,7 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
     has_gnd = MODEL_STORE.get("gnd_model") is not None
     has_sam = MODEL_STORE.get("sam_predictor") is not None
     has_sam_auto = MODEL_STORE.get("sam_automatic_generator") is not None
-    has_clip = MODEL_STORE.get("clip_model") is not None and MODEL_STORE.get("clip_preprocess") is not None
+    has_siglip = siglip_classifier_available()
 
     if task_type == "detection":
         if text_prompts and (has_gnd or has_sam):
@@ -418,16 +431,14 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
             strategy = "stub"
         use_clip_flag = False
     elif task_type == "classification":
-        if text_prompts and (has_gnd or has_sam):
-            strategy = _strategy_name("gnd+sam-text")
+        if classification_mode == "image":
+            strategy = "siglip-image" if has_siglip else "stub"
         elif has_gnd:
-            strategy = "gnd-only"
-        elif has_sam_auto:
-            strategy = "sam-auto"
-        elif has_sam:
-            strategy = "sam-predictor-only"
+            strategy = "gnd+siglip-classify" if (use_clip_flag and has_siglip) else "gnd-classify"
         else:
             strategy = "stub"
+        if classification_mode == "object" and has_gnd and not use_clip_flag and has_siglip:
+            logger.info("Classification object mode: SigLIP2 disabled; using GND phrase mapping only.")
     else:
         if has_gnd and has_sam:
             strategy = _strategy_name("gnd+sam")
@@ -440,13 +451,18 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
         else:
             strategy = "stub"
 
+    use_siglip_for_classification = use_clip_flag and has_siglip
+
     logger.info(
-        "Selected preannotation strategy: %s (task_type=%s) classes=%s text_prompts=%s use_qwen=%s",
+        "Selected preannotation strategy: %s (task_type=%s) classes=%s text_prompts=%s "
+        "use_qwen=%s classification_mode=%s use_siglip=%s",
         strategy,
         task_type or "auto",
         class_names,
         text_prompts,
         use_qwen,
+        classification_mode if task_type == "classification" else "-",
+        use_siglip_for_classification if task_type == "classification" else use_clip_flag,
     )
 
     annotations: List[Dict[str, Any]] = []
@@ -472,162 +488,86 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
             {"id": img_id, "width": w, "height": h, "file_name": p_path.name}
         )
 
-        use_text_guided = False
-        prompts_for_this: List[str] = []
-        if task_type == "segmentation" and effective_seg_prompts:
-            use_text_guided = True
-            prompts_for_this = effective_seg_prompts
-        elif task_type in ("detection", "classification", "other") and text_prompts and (
-            has_gnd or has_sam
-        ):
-            use_text_guided = True
-            prompts_for_this = text_prompts
-
-        if use_text_guided and prompts_for_this:
-            tg_results = run_text_guided_segmentation(
-                p,
-                prompts_for_this,
-                score_threshold=score_thr,
-                max_boxes_per_prompt=max_boxes,
-                sam_multimask_k=3,
-            )
-            logger.info(
-                "Text-guided segmentation yielded %d masks for %s",
-                len(tg_results),
-                p_path.name,
-            )
-            for res in tg_results:
-                mask = res["mask"]
-                bbox = res["bbox"]
-                score = float(res["score"])
-                label = res.get("label", res.get("prompt", "object"))
-                mask_fname = f"{p_path.stem}_ann_{ann_id}.png"
-                mask_path = masks_dir / mask_fname
-                try:
-                    Image.fromarray((mask * 255).astype(np.uint8)).save(mask_path)
-                except Exception:
-                    mimg = Image.fromarray((mask * 255).astype(np.uint8))
-                    mimg.save(mask_path)
-                x0, y0, x1, y1 = bbox
-                fallback_label = class_names[0] if class_names else "object"
-                mapped_label = _match_label_to_class(str(label), class_names)
-                cat_id = name_to_catid.get(
-                    mapped_label, name_to_catid.get(fallback_label, 1)
+        if task_type == "classification":
+            if classification_mode == "image":
+                cls_results = run_image_classification(
+                    p,
+                    class_names,
+                    use_siglip=use_siglip_for_classification or has_siglip,
                 )
-                segmentation, area = _mask_to_coco_segmentation(mask)
-                ann = {
-                    "id": ann_id,
-                    "image_id": img_id,
-                    "category_id": cat_id,
-                    "bbox": [x0, y0, x1 - x0, y1 - y0],
-                    "score": score,
-                    "segmentation": segmentation,
-                    "iscrowd": 0,
-                    "area": area,
-                    "mask_path": f"masks/{mask_fname}",
-                }
-                annotations.append(ann)
-                ann_id += 1
-        else:
-            if strategy in ("gnd-only", "gnd+sam", "gnd+sam3"):
-                boxes_all: List[Dict[str, Any]] = []
-                for cname in class_names:
-                    try:
-                        boxes = run_inference_grounding_dino(
-                            p, cname, score_thr, max_boxes
-                        )
-                    except Exception as e:
-                        logger.exception(
-                            "GroundingDINO failed for class %s: %s", cname, e
-                        )
-                        boxes = []
-                    for b in boxes:
-                        b["pred_class"] = cname
-                        boxes_all.append(b)
-                filtered = sorted(
-                    boxes_all,
-                    key=lambda x: -x.get("score", 0.0),
-                )[:max_boxes]
-                for b in filtered:
-                    x0, y0, x1, y1 = [int(v) for v in b["bbox"]]
-
-                    if (
-                        task_type == "classification"
-                        and MODEL_STORE.get("clip_model") is not None
-                        and MODEL_STORE.get("clip_preprocess") is not None
-                    ):
-                        try:
-                            from tempfile import NamedTemporaryFile
-
-                            crop = img.crop((x0, y0, x1, y1))
-                            with NamedTemporaryFile(suffix=".jpg", delete=False) as tmpf:
-                                tmp_path = tmpf.name
-                            crop.save(tmp_path)
-                            clip_results = run_inference_clip_classify(
-                                tmp_path, class_names
-                            )
-                            if clip_results:
-                                best_clip = max(
-                                    clip_results,
-                                    key=lambda r: float(r.get("score", 0.0)),
-                                )
-                                pred_label = best_clip.get(
-                                    "label", b.get("pred_class", class_names[0])
-                                )
-                                pred_score = float(best_clip.get("score", 0.0))
-                            else:
-                                pred_label = b.get(
-                                    "pred_class", class_names[0]
-                                )
-                                pred_score = float(b.get("score", 0.0))
-                        except Exception:
-                            pred_label = b.get("pred_class", class_names[0])
-                            pred_score = float(b.get("score", 0.0))
-                        finally:
-                            try:
-                                import os
-
-                                os.unlink(tmp_path)
-                            except Exception:
-                                pass
-                        cat_id = name_to_catid.get(
-                            pred_label, name_to_catid.get(class_names[0], 1)
-                        )
-                        score_val = pred_score
-                    else:
-                        cat_id = name_to_catid.get(
-                            b.get("pred_class", class_names[0]), 1
-                        )
-                        score_val = float(b.get("score", 0.0))
-
-                    ann = {
+            else:
+                cls_results = run_object_classification(
+                    p,
+                    class_names,
+                    score_threshold=score_thr,
+                    max_boxes=max_boxes,
+                    use_siglip=use_siglip_for_classification,
+                    class_size_hints=data.get("class_size_hints") or {},
+                )
+            for res in cls_results:
+                x0, y0, x1, y1 = [int(v) for v in res["bbox"]]
+                label = match_label_to_class(str(res.get("label", "")), class_names)
+                cat_id = name_to_catid.get(label, name_to_catid.get(class_names[0], 1))
+                annotations.append(
+                    {
                         "id": ann_id,
                         "image_id": img_id,
                         "category_id": cat_id,
                         "bbox": [x0, y0, x1 - x0, y1 - y0],
-                        "score": score_val,
+                        "score": float(res.get("score", 0.0)),
                         "segmentation": [],
                         "iscrowd": 0,
                     }
-                    annotations.append(ann)
-                    ann_id += 1
-            elif strategy == "sam-auto":
-                proposals = run_inference_sam_auto(p, max_masks=MAX_MASKS_PER_IMAGE)
-                for prop in proposals:
-                    mask = prop["mask"]
-                    bbox = prop["bbox"]
-                    score = float(prop.get("score", 0.0))
-                    if score < score_thr:
-                        continue
+                )
+                ann_id += 1
+        else:
+            use_text_guided = False
+            prompts_for_this: List[str] = []
+            if task_type == "segmentation" and effective_seg_prompts:
+                use_text_guided = True
+                prompts_for_this = effective_seg_prompts
+            elif task_type in ("detection", "other") and text_prompts and (
+                has_gnd or has_sam
+            ):
+                use_text_guided = True
+                prompts_for_this = text_prompts
+
+            if use_text_guided and prompts_for_this:
+                tg_results = run_text_guided_segmentation(
+                    p,
+                    prompts_for_this,
+                    score_threshold=score_thr,
+                    max_boxes_per_prompt=max_boxes,
+                    sam_multimask_k=3,
+                )
+                logger.info(
+                    "Text-guided segmentation yielded %d masks for %s",
+                    len(tg_results),
+                    p_path.name,
+                )
+                for res in tg_results:
+                    mask = res["mask"]
+                    bbox = res["bbox"]
+                    score = float(res["score"])
+                    label = res.get("label", res.get("prompt", "object"))
                     mask_fname = f"{p_path.stem}_ann_{ann_id}.png"
                     mask_path = masks_dir / mask_fname
-                    Image.fromarray((mask * 255).astype(np.uint8)).save(mask_path)
+                    try:
+                        Image.fromarray((mask * 255).astype(np.uint8)).save(mask_path)
+                    except Exception:
+                        mimg = Image.fromarray((mask * 255).astype(np.uint8))
+                        mimg.save(mask_path)
                     x0, y0, x1, y1 = bbox
+                    fallback_label = class_names[0] if class_names else "object"
+                    mapped_label = _match_label_to_class(str(label), class_names)
+                    cat_id = name_to_catid.get(
+                        mapped_label, name_to_catid.get(fallback_label, 1)
+                    )
                     segmentation, area = _mask_to_coco_segmentation(mask)
                     ann = {
                         "id": ann_id,
                         "image_id": img_id,
-                        "category_id": name_to_catid.get(class_names[0], 1),
+                        "category_id": cat_id,
                         "bbox": [x0, y0, x1 - x0, y1 - y0],
                         "score": score,
                         "segmentation": segmentation,
@@ -638,28 +578,92 @@ async def preannotate(payload: str = Form(...), images: List[UploadFile] = File(
                     annotations.append(ann)
                     ann_id += 1
             else:
-                bbox = [0, 0, w, h]
-                mask = np.zeros((h, w), dtype=np.uint8)
-                mask[:, :] = 1
-                mask_fname = f"{p_path.stem}_ann_{ann_id}.png"
-                Image.fromarray((mask * 255).astype(np.uint8)).save(
-                    masks_dir / mask_fname
-                )
-                segmentation, area = _mask_to_coco_segmentation(mask)
-                annotations.append(
-                    {
-                        "id": ann_id,
-                        "image_id": img_id,
-                        "category_id": name_to_catid.get(class_names[0], 1),
-                        "bbox": [0, 0, w, h],
-                        "score": 1.0,
-                        "segmentation": segmentation,
-                        "iscrowd": 0,
-                        "area": area,
-                        "mask_path": f"masks/{mask_fname}",
-                    }
-                )
-                ann_id += 1
+                if strategy in ("gnd-only", "gnd+sam", "gnd+sam3"):
+                    boxes_all: List[Dict[str, Any]] = []
+                    for cname in class_names:
+                        try:
+                            boxes = run_inference_grounding_dino(
+                                p, cname, score_thr, max_boxes
+                            )
+                        except Exception as e:
+                            logger.exception(
+                                "GroundingDINO failed for class %s: %s", cname, e
+                            )
+                            boxes = []
+                        for b in boxes:
+                            b["pred_class"] = cname
+                            boxes_all.append(b)
+                    filtered = sorted(
+                        boxes_all,
+                        key=lambda x: -x.get("score", 0.0),
+                    )[:max_boxes]
+                    for b in filtered:
+                        x0, y0, x1, y1 = [int(v) for v in b["bbox"]]
+                        cat_id = name_to_catid.get(
+                            b.get("pred_class", class_names[0]), 1
+                        )
+                        score_val = float(b.get("score", 0.0))
+
+                        ann = {
+                            "id": ann_id,
+                            "image_id": img_id,
+                            "category_id": cat_id,
+                            "bbox": [x0, y0, x1 - x0, y1 - y0],
+                            "score": score_val,
+                            "segmentation": [],
+                            "iscrowd": 0,
+                        }
+                        annotations.append(ann)
+                        ann_id += 1
+                elif strategy == "sam-auto":
+                    proposals = run_inference_sam_auto(p, max_masks=MAX_MASKS_PER_IMAGE)
+                    for prop in proposals:
+                        mask = prop["mask"]
+                        bbox = prop["bbox"]
+                        score = float(prop.get("score", 0.0))
+                        if score < score_thr:
+                            continue
+                        mask_fname = f"{p_path.stem}_ann_{ann_id}.png"
+                        mask_path = masks_dir / mask_fname
+                        Image.fromarray((mask * 255).astype(np.uint8)).save(mask_path)
+                        x0, y0, x1, y1 = bbox
+                        segmentation, area = _mask_to_coco_segmentation(mask)
+                        ann = {
+                            "id": ann_id,
+                            "image_id": img_id,
+                            "category_id": name_to_catid.get(class_names[0], 1),
+                            "bbox": [x0, y0, x1 - x0, y1 - y0],
+                            "score": score,
+                            "segmentation": segmentation,
+                            "iscrowd": 0,
+                            "area": area,
+                            "mask_path": f"masks/{mask_fname}",
+                        }
+                        annotations.append(ann)
+                        ann_id += 1
+                else:
+                    bbox = [0, 0, w, h]
+                    mask = np.zeros((h, w), dtype=np.uint8)
+                    mask[:, :] = 1
+                    mask_fname = f"{p_path.stem}_ann_{ann_id}.png"
+                    Image.fromarray((mask * 255).astype(np.uint8)).save(
+                        masks_dir / mask_fname
+                    )
+                    segmentation, area = _mask_to_coco_segmentation(mask)
+                    annotations.append(
+                        {
+                            "id": ann_id,
+                            "image_id": img_id,
+                            "category_id": name_to_catid.get(class_names[0], 1),
+                            "bbox": [0, 0, w, h],
+                            "score": 1.0,
+                            "segmentation": segmentation,
+                            "iscrowd": 0,
+                            "area": area,
+                            "mask_path": f"masks/{mask_fname}",
+                        }
+                    )
+                    ann_id += 1
 
         try:
             anns_for_img = [a for a in annotations if a["image_id"] == img_id]
@@ -881,22 +885,17 @@ def health():
     sam_ck_exists = bool(SAM_CHECKPOINT and Path(SAM_CHECKPOINT).exists()) if using_local_sam_checkpoint else False
     gnd_ck_exists = bool(GND_DINO_CHECKPOINT and Path(GND_DINO_CHECKPOINT).exists())
 
-    from .models import CLIP_AVAILABLE, CLIP_BACKEND, GND_DINO_CUDA_OPS, GND_DINO_LAST_ERROR
+    from .models import GND_DINO_CUDA_OPS, GND_DINO_LAST_ERROR
 
-    clip_pkg_installed = bool("CLIP_AVAILABLE" in globals() and CLIP_AVAILABLE)
-    clip_model_loaded = MODEL_STORE.get("clip_model") is not None
-    clip_preprocess_present = MODEL_STORE.get("clip_preprocess") is not None
-    import sys as _sys
-
-    if MODEL_STORE.get("clip_device") is not None:
-        clip_device = MODEL_STORE.get("clip_device")
-    else:
+    siglip_loaded = siglip_classifier_available()
+    siglip_device = MODEL_STORE.get("siglip_device")
+    if siglip_device is None:
         try:
             import torch
 
-            clip_device = "cuda" if (("torch" in _sys.modules) and torch.cuda.is_available()) else "cpu"
+            siglip_device = "cuda" if torch.cuda.is_available() else "cpu"
         except Exception:
-            clip_device = "cpu"
+            siglip_device = "cpu"
 
     return {
         "status": "ok",
@@ -929,11 +928,17 @@ def health():
         "sam3_model_id": SAM3_MODEL_ID,
         "groundingdino_checkpoint_path": GND_DINO_CHECKPOINT,
         "groundingdino_config_path": GND_DINO_CONFIG,
-        "clip_package_installed": clip_pkg_installed,
-        "clip_backend": CLIP_BACKEND,
-        "clip_model_loaded": clip_model_loaded,
-        "clip_preprocess_present": clip_preprocess_present,
-        "clip_device": clip_device,
+        "siglip_available": SIGLIP_AVAILABLE,
+        "siglip_model_id": SIGLIP2_MODEL_ID,
+        "siglip_classifier_loaded": siglip_loaded,
+        "siglip_device": siglip_device,
+        "siglip_last_error": SIGLIP_LAST_ERROR,
+        # backward-compatible health keys (UI may still read these)
+        "clip_package_installed": SIGLIP_AVAILABLE,
+        "clip_backend": "siglip2" if siglip_loaded else None,
+        "clip_model_loaded": siglip_loaded,
+        "clip_preprocess_present": siglip_loaded,
+        "clip_device": siglip_device,
         "qwen_available": ensure_qwen_loaded(),
         "qwen_model_id": QWEN_MODEL_ID,
     }
